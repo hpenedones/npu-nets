@@ -161,7 +161,279 @@ non-linearities can learn &mdash; so we choose the one that maximizes
 hardware utilization.
 </div>
 
-<h2>2. The Hardware</h2>
+<h2>2. Background</h2>
+
+<p>
+This section provides the hardware and systems context that most ML engineers
+never need to think about &mdash; until they want to understand <em>why</em>
+certain hardware is fast (or slow) for their models. If you&rsquo;ve trained
+models with PyTorch or JAX and think of hardware as &ldquo;a GPU with some
+VRAM,&rdquo; this section fills in the gap between that abstraction and the
+physical reality of a spatial processor like the XDNA&nbsp;2 NPU.
+</p>
+
+<h3>2.1 Glossary of acronyms</h3>
+
+<p>
+The table below defines every acronym used in this paper. We group them by
+domain so you can revisit this section as a reference while reading.
+</p>
+
+<table>
+  <tr><th>Acronym</th><th>Stands for</th><th>What it means</th></tr>
+
+  <tr><td colspan="3" style="background:#e8e8e8;font-weight:600;">
+    Hardware &amp; memory</td></tr>
+  <tr><td>NPU</td><td>Neural Processing Unit</td>
+      <td>A dedicated accelerator for neural-network inference (and
+          sometimes training), built into a laptop or phone chip.</td></tr>
+  <tr><td>APU</td><td>Accelerated Processing Unit</td>
+      <td>AMD&rsquo;s name for a single die that integrates CPU + GPU + NPU.</td></tr>
+  <tr><td>XDNA</td><td>(AMD brand name)</td>
+      <td>AMD&rsquo;s NPU architecture family. XDNA&nbsp;2 is the second
+          generation, found in &ldquo;Strix Point&rdquo; Ryzen AI chips.</td></tr>
+  <tr><td>AIE</td><td>AI Engine</td>
+      <td>The individual tile processor IP inside the XDNA NPU, originally
+          designed by Xilinx (acquired by AMD).</td></tr>
+  <tr><td>SRAM</td><td>Static Random-Access Memory</td>
+      <td>Fast, on-chip memory (~1&ndash;2 ns access). Each compute tile has
+          ~64 KB of SRAM. Expensive per bit, but extremely fast because it
+          sits right next to the compute logic.</td></tr>
+  <tr><td>DRAM</td><td>Dynamic Random-Access Memory</td>
+      <td>The main system memory (8&ndash;64 GB). Much slower than SRAM
+          (~50&ndash;100 ns access) but vastly cheaper per bit.</td></tr>
+  <tr><td>DDR</td><td>Double Data Rate</td>
+      <td>The interface standard for DRAM modules. &ldquo;DDR memory&rdquo; is
+          the system RAM your laptop uses. In this paper, &ldquo;DDR&rdquo;
+          means &ldquo;host-side main memory.&rdquo;</td></tr>
+  <tr><td>DMA</td><td>Direct Memory Access</td>
+      <td>A hardware mechanism that copies data between memory regions
+          <em>without using the CPU</em>. The NPU&rsquo;s shim tiles contain
+          DMA engines that move data between DDR and tile SRAM.</td></tr>
+  <tr><td>PCIe</td><td>Peripheral Component Interconnect Express</td>
+      <td>The high-speed bus connecting the NPU to the rest of the system.</td></tr>
+
+  <tr><td colspan="3" style="background:#e8e8e8;font-weight:600;">
+    Compute concepts</td></tr>
+  <tr><td>SIMD</td><td>Single Instruction, Multiple Data</td>
+      <td>A processor executes one instruction on a <em>vector</em> of values
+          simultaneously. For example, multiplying 32 numbers in one clock
+          cycle instead of one at a time. This is how GPUs and NPUs achieve
+          massive throughput.</td></tr>
+  <tr><td>VLIW</td><td>Very Long Instruction Word</td>
+      <td>A processor design where each instruction encodes <em>multiple
+          operations</em> to execute in parallel (e.g., a multiply, an add,
+          and a load all in one cycle). Each AIE tile uses a VLIW core.</td></tr>
+  <tr><td>MMUL</td><td>Matrix Multiply (unit)</td>
+      <td>A hardware block dedicated to multiplying small matrices (e.g.,
+          8&times;8 blocks of bfloat16). This is the workhorse of each AIE
+          tile.</td></tr>
+  <tr><td>FIFO</td><td>First In, First Out</td>
+      <td>A queue where data is read in the same order it was written. The
+          NPU uses hardware FIFOs (&ldquo;ObjectFIFOs&rdquo;) to stream data
+          between tiles, like Unix pipes between processes.</td></tr>
+  <tr><td>GEMM</td><td>General Matrix Multiply</td>
+      <td>The standard linear algebra operation C = A &times; B + C. Neural
+          network layers are essentially sequences of GEMMs with
+          non-linearities in between.</td></tr>
+
+  <tr><td colspan="3" style="background:#e8e8e8;font-weight:600;">
+    Numeric formats</td></tr>
+  <tr><td>bf16 / bfloat16</td><td>Brain Floating Point, 16-bit</td>
+      <td>A 16-bit floating-point format with the same exponent range as
+          float32 (8 bits) but less precision (7-bit mantissa vs 23-bit).
+          Invented at Google Brain for ML training where range matters more
+          than precision.</td></tr>
+  <tr><td>BFP16</td><td>Block Floating Point, 16-bit</td>
+      <td>An emulation mode on AIE2P that groups bf16 values into blocks
+          sharing a common exponent. Enables efficient SIMD matmul in the
+          MMUL unit with tile factor r = s = t = 8.</td></tr>
+  <tr><td>INT8</td><td>8-bit Integer</td>
+      <td>8-bit integer arithmetic, used for quantized inference. The
+          NPU&rsquo;s peak in INT8 mode is 50 TOPS (double the bf16
+          rate).</td></tr>
+
+  <tr><td colspan="3" style="background:#e8e8e8;font-weight:600;">
+    Performance metrics</td></tr>
+  <tr><td>FLOPS</td><td>Floating-point Operations Per Second</td>
+      <td>The standard measure of compute throughput. One multiply-add on
+          two numbers counts as 2 FLOPs.</td></tr>
+  <tr><td>GFLOPS</td><td>Giga&nbsp;FLOPS (10<sup>9</sup>)</td>
+      <td>Billions of floating-point operations per second.</td></tr>
+  <tr><td>TFLOPS</td><td>Tera&nbsp;FLOPS (10<sup>12</sup>)</td>
+      <td>Trillions of floating-point operations per second. The NPU&rsquo;s
+          peak is 25 TFLOPS in bfloat16.</td></tr>
+  <tr><td>TOPS</td><td>Tera Operations Per Second</td>
+      <td>Like TFLOPS but for integer operations. Used for INT8 peak specs
+          (50 TOPS for this NPU).</td></tr>
+
+  <tr><td colspan="3" style="background:#e8e8e8;font-weight:600;">
+    Machine learning</td></tr>
+  <tr><td>MLP</td><td>Multi-Layer Perceptron</td>
+      <td>A neural network made of fully-connected (dense) layers. Each
+          layer computes y = activation(x &times; W + b).</td></tr>
+  <tr><td>ReLU</td><td>Rectified Linear Unit</td>
+      <td>The activation function max(x, 0). Simple, cheap to compute, and
+          widely used.</td></tr>
+
+  <tr><td colspan="3" style="background:#e8e8e8;font-weight:600;">
+    Toolchain &amp; software</td></tr>
+  <tr><td>IRON</td><td>(name, not an acronym)</td>
+      <td>AMD&rsquo;s Python API for programming AIE tiles at a high level:
+          defining kernels, ObjectFIFOs, and tile placements.</td></tr>
+  <tr><td>MLIR</td><td>Multi-Level Intermediate Representation</td>
+      <td>A compiler framework (from the LLVM project) that represents
+          programs at multiple abstraction levels. MLIR-AIE is the dialect
+          that targets AIE hardware.</td></tr>
+  <tr><td>XRT</td><td>Xilinx Runtime</td>
+      <td>The userspace library and kernel driver that loads bitstreams onto
+          the NPU and manages execution.</td></tr>
+  <tr><td>XCLBIN</td><td>Xilinx Container for Linux Binary</td>
+      <td>The compiled binary file that contains the NPU bitstream (tile
+          configuration, routing, kernel code).</td></tr>
+  <tr><td>LLVM</td><td>Low Level Virtual Machine</td>
+      <td>A widely-used compiler infrastructure. Peano/LLVM-AIE is a fork
+          that compiles C++ to AIE tile machine code.</td></tr>
+  <tr><td>BD</td><td>Buffer Descriptor</td>
+      <td>A hardware structure in the DMA engine that describes one data
+          transfer: source address, size, stride pattern. The 10-bit size
+          field (max 1024) is a constraint discussed in Section 4.3.</td></tr>
+</table>
+
+<h3>2.2 How CPUs execute neural networks (and why it&rsquo;s slow)</h3>
+
+<p>
+When you call <code>y = torch.relu(x @ W)</code> on a CPU, here is what
+actually happens at the hardware level:
+</p>
+
+<ol>
+  <li>The weight matrix <code>W</code> lives in DRAM. The CPU issues a load
+      instruction, and the data travels through the <strong>memory
+      hierarchy</strong>: DRAM &rarr; L3 cache &rarr; L2 cache &rarr; L1 cache
+      &rarr; registers.</li>
+  <li>The CPU&rsquo;s SIMD units multiply a few rows at a time. The result
+      goes back through the cache hierarchy to DRAM.</li>
+  <li>For the next layer, the process repeats: read the activation from DRAM,
+      read the next weight matrix from DRAM, compute, write back.</li>
+</ol>
+
+<p>
+The fundamental problem is the <strong>memory wall</strong>: modern compute
+units can perform arithmetic far faster than memory can supply data. A typical
+CPU can do ~1 TFLOPS of bf16 math, but its DRAM bandwidth is ~50 GB/s. To
+keep the ALUs busy doing a 128&times;128 matmul, you need 128&times;128&times;2
+= 32 KB of weight data delivered every ~1 &mu;s &mdash; which is 32 GB/s just
+for one matrix. If you&rsquo;re running 4 layers, that&rsquo;s 128 GB/s,
+already exceeding the memory bandwidth. The CPU stalls waiting for data.
+</p>
+
+<div class="highlight">
+<strong>The memory wall in one sentence:</strong> Arithmetic is cheap; moving
+data is expensive. The deeper you go in a neural network, the more time is
+spent shuffling data between memory levels, not doing useful math.
+</div>
+
+<h3>2.3 The spatial dataflow alternative</h3>
+
+<p>
+A <strong>spatial architecture</strong> takes a radically different approach.
+Instead of one fast processor with a deep cache hierarchy, it uses <em>many
+small processors</em> (tiles), each with a tiny but <em>extremely fast</em>
+local memory (SRAM). Data moves between tiles through dedicated hardware
+channels (FIFOs), not through shared caches.
+</p>
+
+<p>
+Think of it like a factory assembly line versus a single master craftsman:
+</p>
+
+<ul>
+  <li><strong>CPU (craftsman):</strong> One highly skilled worker goes to the
+      warehouse (DRAM) for each part, brings it to the workbench (registers),
+      processes it, takes the result back to the warehouse, gets the next part.
+      Most time is spent walking, not working.</li>
+  <li><strong>NPU (assembly line):</strong> Many workers sit at their
+      stations with all their parts already on their desk (SRAM). A conveyor
+      belt (FIFO) moves the workpiece from one station to the next. Nobody
+      walks anywhere.</li>
+</ul>
+
+<p>
+The key property is <strong>data locality</strong>: once data is loaded into a
+tile&rsquo;s 64 KB SRAM, it stays there for as many operations as you can do
+on it. There is no cache to get evicted from, no bus to contend for. If a
+128&times;128 weight matrix (32 KB) fits in SRAM, you can multiply against it
+thousands of times at full speed &mdash; which is exactly what our recurrent
+MLP does.
+</p>
+
+<h3>2.4 Key hardware concepts used in this project</h3>
+
+<p>
+These concepts appear throughout the paper. You don&rsquo;t need to understand
+every transistor, but knowing these ideas will make the design choices clear:
+</p>
+
+<h4>Double buffering (ping-pong)</h4>
+<p>
+If a tile needs to <em>receive</em> new data while <em>computing</em> on data
+it already has, you need two buffers: one being filled by DMA while the other
+is being read by the compute unit. They swap roles each iteration. We use this
+for the activation buffers: buffer A holds the input, the tile computes into
+buffer B, then B becomes the input and A becomes the output.
+</p>
+
+<h4>Tiled matrix layout</h4>
+<p>
+A &ldquo;row-major&rdquo; matrix stores elements left-to-right, top-to-bottom:
+<code>[[a, b], [c, d]]</code> becomes <code>[a, b, c, d]</code>. The AIE
+matmul unit instead expects a <strong>blocked (tiled) layout</strong>: the
+matrix is divided into 8&times;8 sub-matrices, and each block is stored
+contiguously. This matches the MMUL hardware which multiplies 8&times;8
+blocks in one operation. The <code>to_tiled()</code> function handles this
+conversion.
+</p>
+
+<h4>ObjectFIFOs and data movement</h4>
+<p>
+On a CPU, data movement is implicit &mdash; you <code>load</code> from an
+address and the cache hierarchy handles the rest. On the NPU, you must
+<em>explicitly</em> program every data transfer: &ldquo;move 4 KB from DDR
+address X to tile (3, 2)&rsquo;s input buffer.&rdquo; IRON&rsquo;s
+<code>ObjectFifo</code> abstraction makes this manageable: you declare a
+typed channel between a producer and a consumer, and the compiler generates
+the DMA configurations.
+</p>
+
+<h4>The invocation overhead problem</h4>
+<p>
+Every time the host CPU tells the NPU to run, there is a fixed overhead of
+~120 &mu;s for driver calls, instruction dispatch, and DMA setup. This is
+analogous to the overhead of launching a CUDA kernel on a GPU. If your actual
+compute takes only 1 &mu;s (as it does for a single small matmul), you are
+spending 99% of the time on overhead. The solution is to do <em>lots of work
+per invocation</em> &mdash; hence the hardware loop that repeats thousands of
+matmuls before returning to the host.
+</p>
+
+<h3>2.5 How to read the rest of this paper</h3>
+
+<p>
+With this background, the rest of the paper should be accessible:
+</p>
+
+<ul>
+  <li><strong>Section 3</strong> describes the physical hardware: the tile
+      grid, memory sizes, and interconnect.</li>
+  <li><strong>Section 4</strong> presents the neural network architecture and
+      explains why each design choice follows from the hardware constraints.</li>
+  <li><strong>Section 5</strong> shows throughput and speedup results.</li>
+  <li><strong>Section 6</strong> describes the software toolchain.</li>
+  <li><strong>Section 7</strong> maps the code structure to the concepts.</li>
+</ul>
+
+<h2>3. The Hardware</h2>
 
 <p>
 The AMD XDNA&nbsp;2 NPU in the Ryzen AI 9 HX 370 (codename Strix Point) is a
@@ -190,7 +462,7 @@ tiled spatial-dataflow processor with the following structure:
   <tr><td>Power envelope</td><td>~6 W</td></tr>
 </table>
 
-<h3>2.1 Why spatial dataflow matters</h3>
+<h3>3.1 Why spatial dataflow matters</h3>
 
 <p>
 On a CPU, a matrix multiply reads data from DRAM through multiple cache levels.
@@ -206,7 +478,7 @@ on the NPU (10% of peak) because it is <em>memory-bandwidth limited</em> &mdash;
 data must stream from DDR. The NPU wins when data <strong>stays on-chip</strong>.
 </div>
 
-<h2>3. The Architecture: Recurrent MLP</h2>
+<h2>4. The Architecture: Recurrent MLP</h2>
 
 <p>
 We choose a recurrent MLP: a single weight matrix <code>W</code> (128&times;128,
@@ -237,7 +509,7 @@ same loop independently on different input samples:
   </div>
 </div>
 
-<h3>3.1 Why this architecture</h3>
+<h3>4.1 Why this architecture</h3>
 
 <ul>
   <li><strong>Maximizes on-chip time:</strong> Weight is loaded once (32 KB) and
@@ -252,7 +524,7 @@ same loop independently on different input samples:
       doubling tiles doubles throughput with no communication overhead.</li>
 </ul>
 
-<h3>3.2 Multi-row data routing</h3>
+<h3>4.2 Multi-row data routing</h3>
 
 <p>
 When using more than 8 tiles (i.e., more than one compute row), data must pass
@@ -276,7 +548,7 @@ At 3 compute rows = 9 streams, this fits; at 4 rows = 12 streams, the MLIR-AIE
 router fails. This caps us at <strong>24 tiles</strong> (3 rows &times; 8 columns).
 </div>
 
-<h3>3.3 Critical implementation constraints</h3>
+<h3>4.3 Critical implementation constraints</h3>
 
 <p>
 Several non-obvious hardware constraints shaped the design:
@@ -296,7 +568,7 @@ Several non-obvious hardware constraints shaped the design:
       output buffer before each matmul, which wastes ~12% of cycle time.</li>
 </ul>
 
-<h2>4. Results</h2>
+<h2>5. Results</h2>
 
 <div class="figure">
   <img src="performance.png" alt="Performance scaling">
@@ -320,7 +592,7 @@ Several non-obvious hardware constraints shaped the design:
       <td>439</td><td><strong>20.4&times;</strong></td></tr>
 </table>
 
-<h3>4.1 Scaling analysis</h3>
+<h3>5.1 Scaling analysis</h3>
 
 <p>
 Per-tile throughput is remarkably consistent at ~360 GFLOPS regardless of tile
@@ -333,7 +605,7 @@ count, confirming that the tiles operate independently with no contention:
 24 tiles &times; 360 GFLOPS/tile =  8.6 TFLOPS  &check;  (near-linear)
 </pre>
 
-<h3>4.2 Gap to theoretical peak</h3>
+<h3>5.2 Gap to theoretical peak</h3>
 
 <p>
 We achieve 8.95 of 25 TFLOPS (35.8%). The remaining gap is well-understood:
@@ -351,7 +623,7 @@ We achieve 8.95 of 25 TFLOPS (35.8%). The remaining gap is well-understood:
       <td>With fused kernel + 24 tiles</td></tr>
 </table>
 
-<h2>5. The Toolchain</h2>
+<h2>6. The Toolchain</h2>
 
 <table>
   <tr><th>Component</th><th>Role</th></tr>
@@ -365,7 +637,7 @@ We achieve 8.95 of 25 TFLOPS (35.8%). The remaining gap is well-understood:
       <td>Runtime for loading and executing on the NPU</td></tr>
 </table>
 
-<h3>5.1 Compilation pipeline</h3>
+<h3>6.1 Compilation pipeline</h3>
 
 <pre>
 design.py  &xrarr;  MLIR  &xrarr;  aiecc  &xrarr;  .xclbin (bitstream)
@@ -375,7 +647,7 @@ mm.cc          &xrarr;  mlp_mm.o    &xrarr;  mlp_kernels.a
 mlp_kernels.cc &xrarr;  mlp_relu.o  &nearr;
 </pre>
 
-<h2>6. Code Structure</h2>
+<h2>7. Code Structure</h2>
 
 <p>
 The project is intentionally minimal &mdash; four Python files and one C++ file:
@@ -402,7 +674,7 @@ mapping: validation, kernel definition, FIFO topology, worker bodies, tensor
 access patterns, and DMA sequences.
 </p>
 
-<h2>7. Future Work</h2>
+<h2>8. Future Work</h2>
 
 <ul>
   <li><strong>Fused matmul kernel:</strong> A C=A&times;B kernel (instead of
