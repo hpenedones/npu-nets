@@ -289,66 +289,67 @@ def draw_recurrent_mlp():
 # ── Figure 3: Performance Scaling ─────────────────────────────────────────
 
 def draw_performance():
-    """Draw throughput scaling chart: tiles vs TFLOPS with CPU baseline."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    """Draw optimisation journey chart: config vs TFLOPS and speedup."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
     fig.patch.set_facecolor("white")
 
-    # Data from benchmarks
-    tiles = np.array([8, 16, 24])
-    tflops = np.array([2.89, 5.74, 8.95])
-    speedup = np.array([12.2, 16.2, 20.4])
-    gflops_per_tile = tflops * 1000 / tiles
+    # Optimisation journey data (all 24 tiles, H=128, depth=1000)
+    labels = ["B=16\nunfused", "B=32\nunfused", "B=48\nunfused", "B=48\nfused"]
+    tflops = np.array([8.98, 13.47, 15.98, 23.93])
+    speedup = np.array([18.5, 19.5, 17.6, 25.9])
+    peak_pct = tflops / 25.0 * 100
+    x = np.arange(len(labels))
 
-    # Left plot: TFLOPS vs tiles
-    ax1.bar(tiles, tflops, width=4, color=COLORS["active"], alpha=0.85,
-            edgecolor="#333", linewidth=0.8, label="NPU throughput")
+    # Highlight the final result
+    colors = [COLORS["input"]] * 3 + [COLORS["active"]]
+
+    # Left plot: TFLOPS optimisation journey
+    bars1 = ax1.bar(x, tflops, width=0.6, color=colors, alpha=0.88,
+                    edgecolor="#333", linewidth=0.8)
     ax1.axhline(y=25.0, color=COLORS["weight"], linestyle="--",
                 linewidth=1.5, alpha=0.6, label="Theoretical peak (25 TFLOPS)")
 
-    # Linear scaling reference
-    ideal = tflops[0] / 8 * np.array([8, 16, 24, 32])
-    ax1.plot([8, 16, 24, 32], ideal, "o--", color="#999",
-             markersize=4, label="Linear scaling from 8 tiles")
+    for i, (tf, pct) in enumerate(zip(tflops, peak_pct)):
+        ax1.text(i, tf + 0.5, f"{tf:.1f}\n({pct:.0f}%)",
+                 ha="center", fontsize=9, fontweight="bold")
 
-    for i, (t, tf) in enumerate(zip(tiles, tflops)):
-        ax1.text(t, tf + 0.3, f"{tf:.2f}", ha="center", fontsize=9,
-                 fontweight="bold")
-
-    ax1.set_xlabel("Number of Compute Tiles", fontsize=11)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, fontsize=9)
     ax1.set_ylabel("Throughput (TFLOPS, bf16)", fontsize=11)
-    ax1.set_title("NPU Throughput Scaling", fontsize=12, fontweight="bold")
-    ax1.set_xticks([8, 16, 24, 32])
-    ax1.set_ylim(0, 28)
-    ax1.legend(fontsize=8)
+    ax1.set_title("NPU Throughput Optimisation", fontsize=12, fontweight="bold")
+    ax1.set_ylim(0, 29)
+    ax1.legend(fontsize=8, loc="upper left")
     ax1.grid(axis="y", alpha=0.3)
 
-    # Right plot: speedup vs tiles
-    bars = ax2.bar(tiles, speedup, width=4, color=COLORS["input"], alpha=0.85,
-                   edgecolor="#333", linewidth=0.8)
+    # Right plot: speedup vs CPU
+    bars2 = ax2.bar(x, speedup, width=0.6, color=colors, alpha=0.88,
+                    edgecolor="#333", linewidth=0.8)
     ax2.axhline(y=1.0, color="#999", linestyle="-", linewidth=0.8)
 
-    for i, (t, s) in enumerate(zip(tiles, speedup)):
-        ax2.text(t, s + 0.5, f"{s:.1f}×", ha="center", fontsize=9,
+    for i, s in enumerate(speedup):
+        ax2.text(i, s + 0.5, f"{s:.1f}×", ha="center", fontsize=9,
                  fontweight="bold")
 
-    ax2.set_xlabel("Number of Compute Tiles", fontsize=11)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(labels, fontsize=9)
     ax2.set_ylabel("Speedup vs CPU (PyTorch bf16)", fontsize=11)
     ax2.set_title("NPU vs CPU Speedup", fontsize=12, fontweight="bold")
-    ax2.set_xticks([8, 16, 24])
-    ax2.set_ylim(0, 25)
+    ax2.set_ylim(0, 30)
     ax2.grid(axis="y", alpha=0.3)
 
-    # Add per-tile efficiency annotation
+    # Per-tile annotation
+    best_per_tile = tflops[-1] * 1000 / 24
     ax2.text(0.98, 0.02,
-             f"Per-tile: ~{gflops_per_tile.mean():.0f} GFLOPS\n"
-             f"({gflops_per_tile.mean()/768*100:.0f}% of ~768 GFLOPS peak)",
+             f"Best per-tile: {best_per_tile:.0f} GFLOPS\n"
+             f"({best_per_tile/768*100:.0f}% of ~768 GFLOPS peak)\n"
+             f"24 tiles, H=128, depth=1000",
              transform=ax2.transAxes, ha="right", va="bottom",
              fontsize=8, color="#666",
              bbox=dict(boxstyle="round,pad=0.3", facecolor="#f0f0f0",
                        edgecolor="#ddd"))
 
     fig.suptitle("TileFlow: Recurrent MLP on AMD XDNA 2 NPU\n"
-                 "H=128, B=16/tile, depth=2000, bfloat16",
+                 "Optimisation journey — 24 tiles, H=128, bfloat16",
                  fontsize=13, fontweight="bold", y=1.02)
     fig.tight_layout()
     path = OUTPUT_DIR / "performance.pdf"
