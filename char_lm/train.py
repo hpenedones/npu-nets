@@ -24,12 +24,24 @@ CHECKPOINT_DIR = Path(__file__).parent.parent / "data"
 
 
 def _clamp_spectral_norm(model: RecurrentCharLM, max_norm: float = 1.0):
-    """Project each W to have spectral norm ≤ max_norm."""
+    """Project each W to have spectral norm ≤ max_norm.
+
+    Skipped when spectral norm is already small (e.g. residual models
+    with scaled init) to avoid SVD convergence issues.
+    """
     with torch.no_grad():
         for W in model.weights:
-            sigma = torch.linalg.norm(W, ord=2)
-            if sigma > max_norm:
-                W.mul_(max_norm / sigma)
+            # Frobenius norm is a cheap upper bound on spectral norm;
+            # skip the expensive SVD if Frobenius < max_norm.
+            fro = torch.linalg.norm(W, ord='fro')
+            if fro <= max_norm:
+                continue
+            try:
+                sigma = torch.linalg.norm(W, ord=2)
+                if sigma > max_norm:
+                    W.mul_(max_norm / sigma)
+            except torch._C._LinAlgError:
+                pass  # ill-conditioned; skip this step
 
 
 def train_epoch(
@@ -39,6 +51,7 @@ def train_epoch(
     device: torch.device,
     grad_clip: float = 1.0,
     log_interval: int = 50,
+    clamp_interval: int = 20,
 ) -> float:
     """Train for one epoch, return average loss."""
     model.train()
@@ -55,7 +68,8 @@ def train_epoch(
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
-        _clamp_spectral_norm(model)
+        if num_batches % clamp_interval == 0:
+            _clamp_spectral_norm(model)
 
         total_loss += loss.item()
         num_batches += 1
@@ -183,6 +197,7 @@ def main():
     print(f"Model parameters:")
     print(f"  Embedding:    {params['embedding']:,}")
     print(f"  Recurrent W:  {params['recurrent_W']:,} ({params['num_layers']} layer(s) × {args.hidden_size}²)")
+    print(f"  Recurrent b:  {params['recurrent_b']:,}")
     print(f"  Readout:      {params['readout']:,}")
     print(f"  Total:        {params['total']:,}")
     print(f"  Depth:        {args.depth} ({model.depth_per_layer}/layer, {args.bptt_depth} with gradients)")

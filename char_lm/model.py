@@ -3,21 +3,38 @@
 """
 Recurrent character-level language model.
 
-Architecture:
-    1. Embedding:  char index  →  128-dim vector                      (CPU)
-    2. Injection:  h = h + embed(char)                                (CPU)
-    3. Recurrence: for each layer W_i:                                (NPU)
-                       h = ReLU(h @ W_i)  ×  (depth / num_layers)
+Architecture (per character step):
+    1. Embedding:  char index  →  128-dim vector  e                   (CPU)
+    2. Recurrence: for each layer i = 0..num_layers-1:                (NPU)
+                       h = h + ReLU(RMSNorm(h) @ W_i + e + b_i)
+    3. Normalise:  h = RMSNorm(h)                                     (CPU)
     4. Readout:    h  →  logits over vocabulary                       (CPU)
 
+The input embedding is injected at every layer (not just once), giving
+each layer direct access to the current character.  Pre-layer RMSNorm
+prevents hidden-state explosion through deep residual chains.
+
 With num_layers=1 this is a weight-tied recurrent net (same W every step).
-With num_layers>1, each layer has its own W — giving more parameters while
-reusing the same NPU design (one NPU call per layer per character).
+With num_layers>1, each layer has its own W and b — giving more parameters
+while reusing the same NPU design (one NPU call per layer per character).
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class RMSNorm(nn.Module):
+    """Root-mean-square layer normalisation."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return x / rms * self.scale
 
 
 class RecurrentCharLM(nn.Module):
@@ -30,7 +47,7 @@ class RecurrentCharLM(nn.Module):
     hidden_size : int
         Dimension of the hidden state and weight matrices (multiple of 8).
     depth : int
-        Total ReLU(h @ W) iterations per character, split across layers.
+        Total ReLU iterations per character, split across layers.
     bptt_depth : int
         How many of the final iterations carry gradients (truncated BPTT).
     num_layers : int
@@ -56,6 +73,12 @@ class RecurrentCharLM(nn.Module):
             nn.Parameter(torch.empty(hidden_size, hidden_size))
             for _ in range(num_layers)
         ])
+        self.biases = nn.ParameterList([
+            nn.Parameter(torch.zeros(hidden_size))
+            for _ in range(num_layers)
+        ])
+        self.pre_norm = RMSNorm(hidden_size)
+        self.post_norm = RMSNorm(hidden_size)
         self.readout = nn.Linear(hidden_size, vocab_size)
 
         self._init_weights()
@@ -67,36 +90,40 @@ class RecurrentCharLM(nn.Module):
     def _init_weights(self):
         """Initialise weights for stable deep recurrence.
 
-        Each W is orthogonal (spectral norm = 1.0).  ReLU provides natural
-        contraction by zeroing ~50% of activations each step, so explicit
-        scaling below 1.0 is unnecessary and kills signal in deep models.
+        Each W is orthogonal, scaled by 1/sqrt(num_layers) so the
+        cumulative residual additions stay bounded.  Biases start at zero.
         """
         for W in self.weights:
             nn.init.orthogonal_(W)
+            W.data.mul_(1.0 / (self.num_layers ** 0.5))
         nn.init.normal_(self.embed.weight, std=0.02)
         nn.init.xavier_uniform_(self.readout.weight)
         nn.init.zeros_(self.readout.bias)
 
-    def _apply_recurrence(self, h: torch.Tensor) -> torch.Tensor:
+    def _apply_recurrence(
+        self, h: torch.Tensor, embed: torch.Tensor
+    ) -> torch.Tensor:
         """Apply all layers sequentially with truncated BPTT.
 
-        Each layer applies h = ReLU(h @ W_i) for depth_per_layer iterations.
-        Only the last bptt_depth iterations (across all layers) carry gradients.
+        Each layer: h = h + ReLU(RMSNorm(h) @ W_i + embed + b_i).
+        The embedding is injected at every layer so each one sees the
+        current character directly.  Pre-norm keeps h bounded.
+        Only the last bptt_depth iterations carry gradients.
         """
         dpl = self.depth_per_layer
         total_iters = dpl * self.num_layers
         no_grad_iters = total_iters - self.bptt_depth
 
         iter_count = 0
-        for W in self.weights:
+        for W, b in zip(self.weights, self.biases):
             for _ in range(dpl):
                 if iter_count < no_grad_iters:
                     with torch.no_grad():
-                        h = F.relu(h @ W)
+                        h = h + F.relu(self.pre_norm(h) @ W + embed + b)
                 else:
                     if iter_count == no_grad_iters:
                         h = h.detach().requires_grad_(True)
-                    h = F.relu(h @ W)
+                    h = h + F.relu(self.pre_norm(h) @ W + embed + b)
                 iter_count += 1
 
         return h
@@ -126,8 +153,8 @@ class RecurrentCharLM(nn.Module):
         all_logits = []
 
         for t in range(seq_len):
-            hidden = hidden + embeds[:, t]
-            hidden = self._apply_recurrence(hidden)
+            hidden = self._apply_recurrence(hidden, embeds[:, t])
+            hidden = self.post_norm(hidden)
             all_logits.append(self.readout(hidden))
 
         logits = torch.stack(all_logits, dim=1)
@@ -161,10 +188,12 @@ class RecurrentCharLM(nn.Module):
 
     def count_parameters(self) -> dict[str, int]:
         """Return parameter counts by component."""
-        recurrent = sum(W.numel() for W in self.weights)
+        recurrent_w = sum(W.numel() for W in self.weights)
+        recurrent_b = sum(b.numel() for b in self.biases)
         return {
             "embedding": self.embed.weight.numel(),
-            "recurrent_W": recurrent,
+            "recurrent_W": recurrent_w,
+            "recurrent_b": recurrent_b,
             "num_layers": self.num_layers,
             "readout": sum(p.numel() for p in self.readout.parameters()),
             "total": sum(p.numel() for p in self.parameters()),
