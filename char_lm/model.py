@@ -5,17 +5,17 @@ Recurrent character-level language model designed to map exactly to NPU.
 
 Architecture (per character step):
     for each block g = 0..num_blocks-1:
-        1. Pre-norm:   h_b = RMSNorm(h)                               (CPU)
-        2. Injection:  h_b = h_b + embed(char) + bias_g               (CPU)
-        3. Block:      h_b = ReLU(..ReLU(h_b @ W[4g]) @ W[4g+1]..)   (NPU)
-        4. Residual:   h = h + h_b                                    (CPU)
-    5. Post-norm:  h = RMSNorm(h)                                     (CPU)
-    6. Readout:    logits = h @ W_out + b_out                         (CPU)
+        1. Injection:  h_b = h + embed(char) + bias_g                 (CPU)
+        2. Block (4 stages, each on one NPU tile):
+             h_b = ReLU(RMSNorm(h_b) @ W[4g+j])  for j = 0..3       (NPU)
+        3. Residual:   h = h + h_b                                    (CPU)
+    4. Post-norm:  h = RMSNorm(h)                                     (CPU)
+    5. Readout:    logits = h @ W_out + b_out                         (CPU)
 
-Each block of 4 layers is a pure matmul+ReLU chain that runs entirely on
-the NPU pipeline (4 stages per column, 8 columns in parallel = 32 tiles).
-CPU handles normalisation, input injection, bias, and residual connections
-between blocks — exactly matching what it does between NPU calls.
+Each pipeline stage fuses RMSNorm + matmul + ReLU.  The norm prevents
+activation explosion through the 4-layer chain and is the key difference
+from the previous "pure matmul+ReLU" blocks.  CPU work between NPU calls
+is limited to embed injection, bias addition, and residual connection.
 
 With block_size=4 and num_layers=32: 8 blocks = 8 NPU calls per character.
 """
@@ -107,10 +107,14 @@ class RecurrentCharLM(nn.Module):
         nn.init.zeros_(self.readout.bias)
 
     def _apply_block(self, h_block: torch.Tensor, block_idx: int) -> torch.Tensor:
-        """Apply one block of pure matmul+ReLU layers (NPU-compatible)."""
+        """Apply one block: per-layer RMSNorm + matmul + ReLU (NPU pipeline).
+
+        Each of the 4 stages normalises its input before the matmul, preventing
+        activation explosion and matching the fused norm+mm+relu NPU kernel.
+        """
         start = block_idx * self.block_size
         for i in range(start, start + self.block_size):
-            h_block = F.relu(h_block @ self.weights[i])
+            h_block = F.relu(self.pre_norm(h_block) @ self.weights[i])
         return h_block
 
     def _apply_recurrence(
@@ -119,9 +123,9 @@ class RecurrentCharLM(nn.Module):
         """Apply all blocks with truncated BPTT.
 
         Each block:
-            h_b = pre_norm(h) + embed + bias
-            h_b = ReLU(..ReLU(h_b @ W0) @ W1 ..)  [block_size layers]
-            h = h + h_b
+            h_b = h + embed + bias_g            (CPU: injection)
+            h_b = norm+mm+relu × 4 layers       (NPU: fused pipeline)
+            h = h + h_b                          (CPU: residual)
 
         Only the last bptt_blocks blocks carry gradients.
         """
@@ -130,13 +134,13 @@ class RecurrentCharLM(nn.Module):
         for g in range(self.num_blocks):
             if g < no_grad_blocks:
                 with torch.no_grad():
-                    h_block = self.pre_norm(h) + embed + self.block_biases[g]
+                    h_block = h + embed + self.block_biases[g]
                     h_block = self._apply_block(h_block, g)
                     h = h + h_block
             else:
                 if g == no_grad_blocks:
                     h = h.detach().requires_grad_(True)
-                h_block = self.pre_norm(h) + embed + self.block_biases[g]
+                h_block = h + embed + self.block_biases[g]
                 h_block = self._apply_block(h_block, g)
                 h = h + h_block
 

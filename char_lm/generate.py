@@ -12,9 +12,9 @@ Usage::
     python -m char_lm.generate --device npu --prompt "To be"
 
 The NPU path uses all 32 compute tiles arranged as 8 columns × 4 rows.
-Each NPU call processes one 4-layer block of matmul+ReLU.  Between calls
-the CPU applies RMSNorm, adds the character embedding and block bias,
-and does the residual connection — exactly matching the trained model.
+Each NPU call processes one 4-layer block.  Each pipeline stage fuses
+RMSNorm + matmul + ReLU on-chip.  Between NPU calls the CPU only adds
+the character embedding, block bias, and residual connection.
 """
 
 import argparse
@@ -106,8 +106,8 @@ def _generate_npu(
 
     For each character step:
         for each block g:
-            CPU:  h_b = RMSNorm(h) + embed + bias_g
-            NPU:  h_b = ReLU(..ReLU(h_b @ W[4g]) @ W[4g+1]..) [4 layers]
+            CPU:  h_b = h + embed + bias_g
+            NPU:  h_b = ReLU(RMSNorm(h_b)@W) × 4 stages  (fused on-chip)
             CPU:  h = h + h_b   (residual)
         CPU:  h = RMSNorm(h)   (post-norm)
         CPU:  logits = h @ readout   (sampling)
@@ -123,12 +123,12 @@ def _generate_npu(
     embed_w = model.embed.weight.data.numpy().astype(bfloat16)
     readout_w = model.readout.weight.data.numpy().astype(np.float32)
     readout_b = model.readout.bias.data.numpy().astype(np.float32)
-    pre_norm_scale = model.pre_norm.scale.data.numpy().astype(np.float32)
+    pre_norm_scale = model.pre_norm.scale.data.numpy().astype(bfloat16)
     post_norm_scale = model.post_norm.scale.data.numpy().astype(np.float32)
     block_biases = [b.data.numpy().astype(bfloat16) for b in model.block_biases]
 
-    # Pre-tile all weight groups
-    # Host layout: [col0_W0, col0_W1, col0_W2, col0_W3, col1_W0, ...]
+    # Pre-tile all weight groups, packing scale with each weight
+    # Layout per stage: [W_tiled(H×H), scale(H)]
     W_tiled_groups = []
     for g in range(num_blocks):
         parts = []
@@ -136,7 +136,7 @@ def _generate_npu(
             for stage in range(STAGES_PER_COL):
                 layer_idx = g * STAGES_PER_COL + stage
                 W_bf16 = model.weights[layer_idx].data.numpy().astype(bfloat16)
-                parts.append(to_tiled(W_bf16))
+                parts.append(np.concatenate([to_tiled(W_bf16), pre_norm_scale]))
         W_tiled_groups.append(np.concatenate(parts))
 
     prompt_ids = vocab.encode(prompt)
@@ -148,12 +148,14 @@ def _generate_npu(
     t0 = time.perf_counter()
 
     def _run_one_block(hidden, embed_vec, block_idx):
-        """Run one block: CPU pre-processing → NPU matmul chain → CPU residual."""
-        # CPU: h_b = RMSNorm(h) + embed + bias
-        h_block = _rms_norm_np(hidden, pre_norm_scale)
-        h_block = h_block + embed_vec[np.newaxis, :] + block_biases[block_idx][np.newaxis, :]
+        """Run one block: CPU injection → NPU norm+matmul+relu chain → CPU residual."""
+        # CPU: h_b = h + embed + bias (no norm — NPU does per-layer norm)
+        h_block = (hidden.astype(np.float32)
+                   + embed_vec.astype(np.float32)[np.newaxis, :]
+                   + block_biases[block_idx].astype(np.float32)[np.newaxis, :]
+                   ).astype(bfloat16)
 
-        # NPU: 4 layers of matmul+ReLU
+        # NPU: 4 stages of RMSNorm + matmul + ReLU
         input_tiled = np.concatenate([
             to_tiled(h_block[c * B : (c + 1) * B])
             for c in range(NUM_COLS)

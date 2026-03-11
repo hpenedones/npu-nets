@@ -4,7 +4,10 @@
 Test and benchmark the 4-stage pipeline MLP on the NPU.
 
 Each column has 4 tiles with different weights.  Data flows through the
-pipeline: h = ReLU(ReLU(ReLU(ReLU(h @ W0) @ W1) @ W2) @ W3).
+pipeline: h = ReLU(RMSNorm(ReLU(RMSNorm(ReLU(RMSNorm(ReLU(RMSNorm(h)@W0))@W1))@W2))@W3).
+
+Each stage fuses RMSNorm + matmul + ReLU, preventing activation explosion
+and matching the trained char-LM architecture.
 
 Usage::
 
@@ -39,17 +42,22 @@ from spatial_mlp.pipeline_op import AIEPipelineMLP, STAGES_PER_COL
 H = 128
 
 
-def reference_pipeline(X, weights, num_stages):
-    """NumPy reference: apply 4 stages of ReLU(x @ W_i) in float32."""
+def reference_pipeline(X, weights, scale, num_stages):
+    """NumPy reference: apply 4 stages of ReLU(RMSNorm(x, scale) @ W_i)."""
     x = X.astype(np.float32)
+    scale_f32 = scale.astype(np.float32)
     for i in range(num_stages):
+        # RMSNorm
+        rms = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True) + 1e-6)
+        x = x / rms * scale_f32
+        # Matmul + ReLU
         W = weights[i].astype(np.float32)
         x = np.maximum(x @ W, 0)
     return x.astype(bfloat16)
 
 
 def generate_test_data(H, B, num_cols, seed=42):
-    """Create random weights and input for benchmarking."""
+    """Create random weights, scale, and input for benchmarking."""
     rng = np.random.default_rng(seed)
     total_stages = num_cols * STAGES_PER_COL
     total_samples = num_cols * B
@@ -60,15 +68,18 @@ def generate_test_data(H, B, num_cols, seed=42):
         W = (rng.standard_normal((H, H)) * 0.8 / np.sqrt(H)).astype(bfloat16)
         weights.append(W)
 
+    # RMSNorm scale vector (shared across all stages, like pre_norm.scale)
+    scale = np.ones(H, dtype=bfloat16)
+
     X = rng.standard_normal((total_samples, H)).astype(bfloat16)
-    return weights, X
+    return weights, scale, X
 
 
-def tile_weights_for_npu(weights, H, num_cols):
-    """Tile and concatenate weights in host buffer layout.
+def tile_weights_for_npu(weights, scale, H, num_cols):
+    """Tile and concatenate weights+scale in host buffer layout.
 
-    Layout: [col0_W0, col0_W1, col0_W2, col0_W3, col1_W0, ...].
-    Each column's 4 weights apply to its batch slice.
+    Layout: [col0_W0+s, col0_W1+s, col0_W2+s, col0_W3+s, col1_W0+s, ...].
+    Each entry is [W_tiled(H×H), scale(H)] contiguous.
 
     For the pipeline test, all columns use the SAME 4 weights (so we can
     compare to a single reference pipeline).
@@ -76,9 +87,8 @@ def tile_weights_for_npu(weights, H, num_cols):
     parts = []
     for col in range(num_cols):
         for stage in range(STAGES_PER_COL):
-            # Each column uses weights for stages 0-3
             W = weights[stage]
-            parts.append(to_tiled(W))
+            parts.append(np.concatenate([to_tiled(W), scale]))
     return np.concatenate(parts)
 
 
@@ -125,19 +135,19 @@ def benchmark(H=128, B=48, num_cols=8, warmup=3, timed_iters=10):
     print(f"{'='*70}")
 
     # Generate test data
-    weights, X = generate_test_data(H, B, num_cols)
+    weights, scale, X = generate_test_data(H, B, num_cols)
 
     # CPU reference (apply stages 0-3 to each column's batch)
     print("\nComputing CPU reference...")
     Y_ref_parts = []
     for col in range(num_cols):
         batch = X[col * B : (col + 1) * B]
-        Y_ref_parts.append(reference_pipeline(batch, weights[:4], stages))
+        Y_ref_parts.append(reference_pipeline(batch, weights[:4], scale, stages))
     Y_ref = np.concatenate(Y_ref_parts, axis=0)
 
     # Tile data for NPU
     X_tiled = tile_activations_for_npu(X, B, num_cols)
-    W_tiled = tile_weights_for_npu(weights, H, num_cols)
+    W_tiled = tile_weights_for_npu(weights, scale, H, num_cols)
     zero_output = np.zeros(total_samples * H, dtype=bfloat16)
 
     # Compile and run on NPU

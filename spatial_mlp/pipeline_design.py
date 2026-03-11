@@ -3,44 +3,46 @@
 Streaming pipeline design for the AMD XDNA 2 NPU.
 
 This module generates MLIR code for a 32-stage pipeline where each compute
-tile holds its *own* weight matrix and applies ``ReLU(x @ W_i)`` exactly
-once.  Data flows vertically through 4 tiles per column, then the host
-orchestrates column-to-column chaining (4 layers per NPU call, 8 calls
-for a full 32-layer pass).
+tile holds its *own* weight matrix + RMSNorm scale vector and applies
+``ReLU(RMSNorm(x, scale) @ W_i)`` exactly once.  Data flows vertically
+through 4 tiles per column, then the host orchestrates column-to-column
+chaining (4 layers per NPU call, 8 calls for a full 32-layer pass).
 
 **Architecture overview**::
 
     Per-column pipeline (one NPU invocation covers all 8 columns in parallel):
 
-    DDR input ──► Shim DMA ──► MemTile ──► Tile(col, row=2)  W0
+    DDR input ──► Shim DMA ──► MemTile ──► Tile(col, row=2)  W0 + scale
                                                   │
-                                           Tile(col, row=3)  W1
+                                           Tile(col, row=3)  W1 + scale
                                                   │
-                                           Tile(col, row=4)  W2
+                                           Tile(col, row=4)  W2 + scale
                                                   │
-                                           Tile(col, row=5)  W3
+                                           Tile(col, row=5)  W3 + scale
                                                   │
     DDR output ◄── Shim DMA ◄── MemTile ◄─────────┘
+
+    Each stage: output = ReLU(RMSNorm(input, scale) @ W)
 
     All 8 columns run the same 4-stage pipeline in parallel on different
     batch slices.  The host calls the NPU 8 times with different weight
     sets to achieve 32 total layers.
 
-**Key differences from the recurrent design (design.py)**:
+**Weight buffer layout** (per tile)::
 
-- Each tile holds a **different** weight matrix (not broadcast).
-- No hardware loop — each tile applies matmul+ReLU exactly once.
-- Tiles within a column are chained via ObjectFIFOs (pipeline).
-- Weights are split per row via MemTile, not broadcast.
+    [W (H×H bf16, tiled 8×8), scale (H bf16, flat)]
+
+    The matmul reads the first H×H elements; RMSNorm reads the last H
+    elements as the learned scale vector.
 
 **SRAM budget** (H=128, B=48)::
 
-    Weight  (one per tile): 128×128×2 = 32 KB
-    Input   (one buffer):    48×128×2 = 12 KB
-    Output  (one buffer):    48×128×2 = 12 KB
-    Stack:                              ~1 KB
-    ──────────────────────────────────────────
-    Total:                             ~57 KB  (fits 64 KB)
+    Weight+scale (one per tile): (128×128+128)×2 = 32.25 KB
+    Input   (one buffer):         48×128×2       = 12 KB
+    Output  (one buffer):         48×128×2       = 12 KB
+    Stack + code:                                 ~1.5 KB
+    ─────────────────────────────────────────────────────
+    Total:                                        ~57.75 KB  (fits 64 KB)
 """
 
 import sys
@@ -68,13 +70,13 @@ def _activation_type(B, H):
 
 
 def _weight_type(H):
-    """IRON buffer type for one tile's weight matrix (H×H bf16)."""
-    return np.ndarray[(H * H,), np.dtype[bfloat16]]
+    """IRON buffer type for one tile's weight + scale (H×H + H bf16)."""
+    return np.ndarray[(H * H + H,), np.dtype[bfloat16]]
 
 
 def _column_weights_type(H):
-    """IRON buffer type for one column's weights (4×H×H bf16)."""
-    return np.ndarray[(STAGES_PER_COL * H * H,), np.dtype[bfloat16]]
+    """IRON buffer type for one column's weights+scales (4×(H×H+H) bf16)."""
+    return np.ndarray[(STAGES_PER_COL * (H * H + H),), np.dtype[bfloat16]]
 
 
 def _host_activation_type(num_cols, B, H):
@@ -83,15 +85,15 @@ def _host_activation_type(num_cols, B, H):
 
 
 def _host_weights_type(num_cols, H):
-    """IRON buffer type for all weights (num_cols × 4 × H × H)."""
-    return np.ndarray[(num_cols * STAGES_PER_COL * H * H,), np.dtype[bfloat16]]
+    """IRON buffer type for all weights+scales (num_cols × 4 × (H×H+H))."""
+    return np.ndarray[(num_cols * STAGES_PER_COL * (H * H + H),), np.dtype[bfloat16]]
 
 
 # ── Kernel definition ────────────────────────────────────────────────────
 
 def _define_kernel(act_ty, weight_ty):
-    """Create the matmul+ReLU kernel: C = ReLU(A × B)."""
-    return Kernel("matmul_relu_bf16_bf16", "mlp_kernels.a",
+    """Create the fused norm+matmul+ReLU kernel: C = ReLU(RMSNorm(A) × W)."""
+    return Kernel("norm_matmul_relu_bf16_bf16", "mlp_kernels.a",
                   [act_ty, weight_ty, act_ty])
 
 
@@ -138,11 +140,12 @@ def _create_column_fifos(col, act_ty, weight_ty, H):
     """
     mem = Tile(col=col, row=1)  # MemTile
 
-    # ── Weights: DDR → MemTile → split to 4 rows ────────────────────
+    # ── Weights+scale: DDR → MemTile → split to 4 rows ────────────
     col_wt_ty = _column_weights_type(H)
+    stage_size = H * H + H  # weight matrix + scale vector per stage
     wt_ddr = ObjectFifo(col_wt_ty, name=f"wt_l3_{col}", depth=1)
     wt_splits = wt_ddr.cons().split(
-        offsets=[H * H * r for r in range(STAGES_PER_COL)],
+        offsets=[stage_size * r for r in range(STAGES_PER_COL)],
         obj_types=[weight_ty] * STAGES_PER_COL,
         names=[f"wt_r{r}_{col}" for r in range(STAGES_PER_COL)],
         depths=[1] * STAGES_PER_COL,
@@ -205,16 +208,18 @@ def _activation_tap(col, num_cols, B, H):
 
 
 def _weights_tap(col, num_cols, H):
-    """TAP to select column col's 4×H×H weight block from the host buffer.
+    """TAP to select column col's 4×(H×H+H) weight+scale block.
 
-    Host buffer layout: [col0_weights(4×H×H), col1_weights(4×H×H), ...].
+    Host buffer layout: [col0_ws(4×(H×H+H)), col1_ws(4×(H×H+H)), ...].
+    Each stage block is [W_tiled(H×H), scale(H)] contiguous.
     """
-    total_size = num_cols * STAGES_PER_COL * H * H
-    block_size = STAGES_PER_COL * H * H
+    stage_size = H * H + H
+    total_size = num_cols * STAGES_PER_COL * stage_size
+    block_size = STAGES_PER_COL * stage_size
     return TensorAccessPattern(
         (1, total_size),
         col * block_size,
-        [1, STAGES_PER_COL, H, H], [0, H * H, H, 1],
+        [1, STAGES_PER_COL, H + 1, H], [0, stage_size, H, 1],
     )
 
 

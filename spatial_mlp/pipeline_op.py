@@ -46,7 +46,8 @@ class AIEPipelineMLP(AIEOperatorBase):
     """IRON operator for the 4-stage pipeline MLP on the XDNA 2 NPU.
 
     Each column is a 4-stage pipeline with different weights per stage.
-    All columns run in parallel on different batch slices.
+    Each stage fuses RMSNorm + matmul + ReLU.  All columns run in parallel
+    on different batch slices.
 
     Args:
         H: Hidden dimension (weight matrix is H×H).
@@ -72,7 +73,7 @@ class AIEPipelineMLP(AIEOperatorBase):
         name = self._artifact_name()
 
         matmul_relu_source = SourceArtifact.new(
-            str(project_dir / "aie_kernels" / "matmul_relu.cc"))
+            str(project_dir / "aie_kernels" / "norm_matmul_relu.cc"))
         copy_source = SourceArtifact.new(
             str(project_dir / "aie_kernels" / "mlp_kernels.cc"))
 
@@ -122,11 +123,11 @@ class AIEPipelineMLP(AIEOperatorBase):
 
         Buffers:
         - ``input``:   num_cols × B × H bf16 (tiled layout)
-        - ``weights``: num_cols × 4 × H × H bf16 (tiled layout)
+        - ``weights``: num_cols × 4 × (H×H + H) bf16 (tiled W + flat scale)
         - ``output``:  num_cols × B × H bf16 (tiled layout)
         """
         total_act = self.num_cols * self.B * self.H
-        total_wt = self.num_cols * STAGES_PER_COL * self.H * self.H
+        total_wt = self.num_cols * STAGES_PER_COL * (self.H * self.H + self.H)
 
         self.add_kernel(
             "pipeline", self.xclbin_artifact,

@@ -6,8 +6,9 @@ AMD Ryzen AI NPU — 32 layers on 32 tiles, no approximations.
 ```
 for each character:
     for each block g = 0..7:
-        CPU:  h_b = RMSNorm(h) + embed(char) + bias_g
-        NPU:  h_b = ReLU(ReLU(ReLU(ReLU(h_b @ W[4g]) @ W[4g+1]) @ W[4g+2]) @ W[4g+3])
+        CPU:  h_b = h + embed(char) + bias_g
+        NPU:  for stage j = 0..3:
+                  h_b = ReLU(RMSNorm(h_b) @ W[4g+j])   ← fused on-chip
         CPU:  h = h + h_b   (residual connection)
     CPU:  logits = h @ W_out + b_out
 ```
@@ -16,7 +17,7 @@ for each character:
 
 | Model | Params | Val Loss | Perplexity | Device |
 |-------|--------|----------|------------|--------|
-| **TileFlow block-RNN** | 542K | 2.42 | 11.2 | NPU (32 tiles) |
+| **TileFlow block-RNN** | 542K | 2.03 | 7.6 | NPU (32 tiles) |
 | Transformer baseline | 818K | 1.89 | 6.6 | GPU |
 
 | Metric | Value |
@@ -29,8 +30,8 @@ for each character:
 ## Quick Start
 
 ```bash
-# Train on GPU (~18 min for 10 epochs)
-HSA_OVERRIDE_GFX_VERSION=11.0.0 python -m char_lm.train --epochs 10
+# Train on GPU (~10 min for 3 epochs)
+HSA_OVERRIDE_GFX_VERSION=11.0.0 python -m char_lm.train --epochs 3
 
 # Generate text on CPU
 python -m char_lm.generate --device cpu --prompt "KING RICHARD"
@@ -49,11 +50,13 @@ the model to match it:
 - **32 layers = 32 tiles.** 8 blocks of 4 layers, one block per pipeline call.
 - **4 rows = 4-stage pipeline.** Within a block, data flows tile-to-tile
   through ObjectFIFOs — no DDR traffic.
+- **Each stage fuses RMSNorm + matmul + ReLU.** Per-layer normalisation
+  prevents activation explosion and closes the quality gap vs simpler blocks.
 - **8 columns = 8 batch slices.** 48 samples per column, 384 total.
-- **H=128 fits SRAM.** Weight (32 KB) + activations (2×12 KB) + stack = 57 KB < 64 KB.
+- **H=128 fits SRAM.** Weight+scale (32.25 KB) + activations (2×12 KB) + stack = 58 KB < 64 KB.
 
-Between blocks, the CPU does what the pipeline can't: RMSNorm, embedding
-injection, bias, and residual connections. The model trains with this exact
+Between blocks, the CPU only adds the embedding and bias (two vector
+additions) plus the residual connection. The model trains with this exact
 structure — what you train is what you deploy.
 
 See the [whitepaper](docs/tileflow_whitepaper.pdf) for full details including
@@ -75,7 +78,8 @@ spatial_mlp/
 └── pipeline_test.py       # NPU benchmark
 
 aie_kernels/
-├── matmul_relu.cc         # Fused C = ReLU(A × B)
+├── norm_matmul_relu.cc    # Fused C = ReLU(RMSNorm(A, scale) × W)
+├── matmul_relu.cc         # Legacy fused C = ReLU(A × B)
 └── mlp_kernels.cc         # copy_bf16 support kernel
 ```
 

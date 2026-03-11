@@ -723,28 +723,27 @@ vector) through 8 blocks:
 <pre>
 for each character:
     for each block g = 0..7:
-        CPU:  h_b = RMSNorm(h) + embed(char) + bias_g       &larr; prepare input
-        NPU:  h_b = ReLU(  ReLU(  ReLU(  ReLU(
-                  h_b @ W[4g]
-              ) @ W[4g+1]
-            ) @ W[4g+2]
-          ) @ W[4g+3] )                                      &larr; 4-stage pipeline
-        CPU:  h = h + h_b                                    &larr; residual connection
-    CPU:  h = RMSNorm(h)                                     &larr; post-norm
-    CPU:  logits = h @ W_out + b_out                         &larr; predict next char
+        CPU:  h_b = h + embed(char) + bias_g              &larr; inject input
+        NPU:  for stage j = 0..3:
+                  h_b = ReLU(RMSNorm(h_b) @ W[4g+j])      &larr; fused on-chip
+        CPU:  h = h + h_b                                  &larr; residual connection
+    CPU:  h = RMSNorm(h)                                   &larr; post-norm
+    CPU:  logits = h @ W_out + b_out                       &larr; predict next char
 </pre>
 
 <p>
-Each of the 8 NPU calls runs a 4-stage matmul+ReLU pipeline:
+Each of the 8 NPU calls runs a 4-stage pipeline where each stage fuses
+RMSNorm&nbsp;+&nbsp;matmul&nbsp;+&nbsp;ReLU:
 </p>
 
 <ol>
-  <li>The CPU prepares the block input: normalise the hidden state, add the
-      character embedding and a per-block learned bias.</li>
+  <li>The CPU prepares the block input: add the character embedding and a
+      per-block learned bias to the hidden state (two vector additions).</li>
   <li>The prepared vector is sent to the NPU, where it passes through 4 tiles
-      in sequence. Each tile multiplies by its own weight matrix W<sub>i</sub>
-      (128&times;128) and applies <a href="#g-relu" class="gref">ReLU</a>,
-      using the fused <code>matmul_relu</code>
+      in sequence. Each tile normalises its input (RMSNorm), multiplies by its
+      own weight matrix W<sub>i</sub> (128&times;128), and applies
+      <a href="#g-relu" class="gref">ReLU</a> &mdash; all in a single fused
+      <code>norm_matmul_relu</code>
       <a href="#v-kernel" class="gref">kernel</a>.</li>
   <li>The NPU returns the result to the CPU, which adds it back to the hidden
       state (residual connection).</li>
@@ -792,10 +791,11 @@ Every architectural choice follows from a hardware constraint:
 </p>
 
 <ul>
-  <li><strong>H=128:</strong> A 128&times;128 weight matrix occupies 32 KB in
+  <li><strong>H=128:</strong> A 128&times;128 weight matrix plus a 128-element
+      RMSNorm scale vector occupies 32.25 KB in
       <a href="#g-bf16" class="gref">bf16</a>. With two activation buffers
       (48&times;128 = 12 KB each, <a href="#v-doublebuf" class="gref">double-buffered</a>)
-      and ~1 KB of stack, the total is 57 KB &mdash; within the 64 KB per-tile
+      and ~1.5 KB of stack+code, the total is ~58 KB &mdash; within the 64 KB per-tile
       <a href="#g-sram" class="gref">SRAM</a> limit.</li>
   <li><strong>4 layers per block:</strong> The NPU has 4 compute rows.
       A 4-stage pipeline uses one row per stage, fully utilizing the vertical
@@ -812,37 +812,42 @@ Every architectural choice follows from a hardware constraint:
       <a href="#g-xrt" class="gref">XRT</a> driver overhead per NPU call.</li>
 </ul>
 
-<h3>4.4 The hardware&ndash;quality trade-off</h3>
+<h3>4.4 Fusing normalisation into the pipeline</h3>
 
 <p>
-Our model architecture is shaped by a fundamental constraint: the NPU pipeline
-executes a pure chain of
-<a href="#g-relu" class="gref">ReLU</a>(x&nbsp;&times;&nbsp;W) operations
-with no CPU intervention between stages. But the best-quality version of the
-model applies normalisation and input injection at <em>every</em> layer &mdash;
-operations that require CPU processing between each matmul.
+The key innovation is a custom NPU kernel that fuses three operations &mdash;
+<a href="#g-rmsnorm" class="gref">RMSNorm</a>, matrix multiply, and
+<a href="#g-relu" class="gref">ReLU</a> &mdash; into a single per-tile function.
+Without this fusion, normalisation would require CPU intervention between every
+pipeline stage, defeating the purpose of the 4-stage streaming pipeline.
 </p>
 
 <p>
-This creates a trade-off:
+The fused <code>norm_matmul_relu</code> kernel for each pipeline stage:
 </p>
 
-<table>
-  <tr><th>Model variant</th><th>Val Loss</th><th>Perplexity</th>
-      <th>NPU-compatible?</th></tr>
-  <tr><td>Per-layer (norm + embed every layer)</td>
-      <td>1.94</td><td>6.9</td><td>No &mdash; CPU needed between every matmul</td></tr>
-  <tr style="background:#d4edda;font-weight:600;">
-      <td>Blocked (4-layer pure groups)</td>
-      <td>2.42</td><td>11.2</td><td>Yes &mdash; exact NPU mapping</td></tr>
-</table>
+<ol>
+  <li><strong>RMSNorm in-place</strong> (scalar float32 for stability): compute
+      the root-mean-square of the input row, divide each element by it, and
+      multiply by the learned scale vector. This is a reduction over 128 elements
+      per row, using 8 Babylonian iterations for the inverse square root to avoid
+      library dependencies.</li>
+  <li><strong>Fused matmul + ReLU</strong> (vectorised bf16): the normalised
+      input feeds directly into the same 2&times;2 tile-expanded matrix multiply
+      used previously, with ReLU applied during the store phase.</li>
+</ol>
 
 <p>
-The blocked model sacrifices quality (perplexity 11.2 vs 6.9) for exact hardware
-mapping. Within each block, the 4-stage matmul+ReLU chain executes entirely in
-tile <a href="#g-sram" class="gref">SRAM</a> with no DDR traffic. Between
-blocks, the CPU handles the operations that need it: normalisation (RMSNorm),
-character embedding injection, bias addition, and residual connections.
+The scale vector (128&nbsp;&times;&nbsp;2 bytes = 256 bytes) is packed at the end
+of each tile&rsquo;s weight buffer: [W (32 KB), scale (256 B)].  This adds only
+0.25 KB per tile, well within the SRAM budget.
+</p>
+
+<p>
+Moving per-layer normalisation into the NPU pipeline closed the quality gap
+from val&nbsp;loss 2.42 (pure matmul+ReLU blocks) to 2.03, approaching the
+per-layer CPU-only model&rsquo;s 1.94 &mdash; while keeping the full 32-layer
+inference on the NPU.
 </p>
 
 <div class="key-insight">
@@ -861,9 +866,11 @@ three techniques (explained in
 </p>
 
 <ul>
-  <li><strong>Pre-block RMSNorm:</strong> Before each block, normalise the
-      hidden state to unit RMS. This prevents the activations from growing
-      exponentially across the 8 blocks and across the 64-character sequence
+  <li><strong>Per-stage RMSNorm:</strong> Each pipeline stage normalises its
+      input to unit RMS <em>before</em> the matrix multiply. Because the norm
+      is fused into the NPU kernel, this happens on-chip with no CPU
+      intervention.  This prevents the activations from growing exponentially
+      through the 4-layer chain and across the 64-character sequence
       during <a href="#s-bptt">backpropagation through time</a>.</li>
   <li><strong>Residual connections:</strong> <code>h = h + block(h)</code>
       after each block. Gradients flow backwards through the identity shortcut,
@@ -891,8 +898,8 @@ The block-recurrent model was trained on the tiny Shakespeare dataset (1.1 MB,
   <tr><th>Model</th><th>Parameters</th><th>Val Loss</th>
       <th>Perplexity</th><th>Device</th></tr>
   <tr style="background:#d4edda;font-weight:600;">
-      <td>Block-recurrent (8&times;4 pipeline)</td>
-      <td>542K</td><td>2.42</td><td>11.2</td><td>NPU (32 tiles)</td></tr>
+      <td>Block-recurrent (fused norm+mm+relu)</td>
+      <td>542K</td><td>2.03</td><td>7.6</td><td>NPU (32 tiles)</td></tr>
   <tr><td>Per-layer recurrent (norm every layer)</td>
       <td>542K</td><td>1.94</td><td>6.9</td><td>CPU/GPU only</td></tr>
   <tr><td>Transformer baseline (GPT-style)</td>
@@ -900,9 +907,10 @@ The block-recurrent model was trained on the tiny Shakespeare dataset (1.1 MB,
 </table>
 
 <p>
-The per-layer model and the transformer baseline serve as quality references.
-The blocked model produces recognisable Shakespearean English, though with
-occasional incoherence &mdash; expected at perplexity 11.2 with a 542K-parameter
+The fused norm+matmul+ReLU kernel closes the quality gap: the NPU model
+(perplexity 7.6) approaches the per-layer CPU model (6.9) and the transformer
+baseline (6.6), while running entirely on the 32-tile NPU pipeline.
+The model produces recognisable Shakespearean English with a 542K-parameter
 model trained on 1 MB of text.
 </p>
 
@@ -923,8 +931,8 @@ model trained on 1 MB of text.
 The 384-sequence throughput is the key figure: by processing 8&nbsp;columns
 &times; 48&nbsp;samples per column in parallel, we amortise the per-call
 overhead across hundreds of sequences. The CPU overhead between NPU calls
-(RMSNorm, embedding lookup, residual addition) accounts for the gap between
-the 1.1 ms of NPU time and the 4.2 ms total latency per character.
+(embedding injection, bias addition, residual connection) is minimal since
+normalisation is now handled on-chip by the fused kernel.
 </p>
 
 <h3>5.3 What limits throughput</h3>
@@ -972,8 +980,8 @@ dimensions, fewer blocks, quantisation) is future work.
 design.py  &xrarr;  MLIR  &xrarr;  aiecc  &xrarr;  .xclbin (bitstream)
                           &xrarr;  .bin   (instruction sequence)
 
-matmul_relu.cc &xrarr;  mlp_mm_relu.o &xrarr;  mlp_kernels.a
-mlp_kernels.cc &xrarr;  mlp_copy.o    &nearr;
+norm_matmul_relu.cc &xrarr;  mlp_norm_mm_relu.o &xrarr;  mlp_kernels.a
+mlp_kernels.cc     &xrarr;  mlp_copy.o         &nearr;
 </pre>
 
 <h2>7. Code Structure</h2>
@@ -1001,8 +1009,8 @@ The project is intentionally minimal &mdash; four Python files and two C++ files
           (8 cols &times; 4 rows)</td></tr>
   <tr><td><code>spatial_mlp/pipeline_op.py</code></td><td>~130</td>
       <td>IRON operator: compilation + runtime buffers</td></tr>
-  <tr><td><code>aie_kernels/matmul_relu.cc</code></td><td>~125</td>
-      <td>Fused C&nbsp;=&nbsp;ReLU(A&nbsp;&times;&nbsp;B)
+  <tr><td><code>aie_kernels/norm_matmul_relu.cc</code></td><td>~170</td>
+      <td>Fused C&nbsp;=&nbsp;ReLU(RMSNorm(A,&nbsp;scale)&nbsp;&times;&nbsp;W)
           <a href="#v-kernel" class="gref">kernel</a> for
           <a href="#g-aie" class="gref">AIE2P</a></td></tr>
   <tr><td><code>aie_kernels/mlp_kernels.cc</code></td><td>~55</td>
@@ -1018,16 +1026,16 @@ infrastructure used by the generator for on-device inference.
 <h2>8. Future Work</h2>
 
 <ul>
-  <li><strong>Close the quality gap:</strong> The blocked model (val loss 2.42)
-      lags the per-layer model (1.94) because normalization and input injection
-      happen only between blocks, not between every layer. Custom NPU kernels
-      that fuse norm+matmul+ReLU could enable per-layer operations within the
-      pipeline, recovering quality without sacrificing NPU mapping.</li>
   <li><strong><a href="#g-int8" class="gref">INT8</a> mode:</strong> The
       NPU&rsquo;s peak is 50 <a href="#g-tops" class="gref">TOPS</a> for
       int8 &mdash; double the bf16 rate. With quantization-aware training, this
       could push effective throughput to ~48 TOPS and allow H=256 (fitting in
       the same SRAM budget).</li>
+  <li><strong>Vectorised RMSNorm:</strong> The current kernel uses scalar
+      float32 for the normalisation reduction. A vectorised implementation
+      using v16float SIMD could reduce the per-stage norm overhead from
+      ~25&nbsp;&mu;s to ~3&nbsp;&mu;s, improving pipeline throughput
+      when compute (not driver overhead) is the bottleneck.</li>
   <li><strong>Training on NPU:</strong> Research NPU backpropagation
       (see <a href="https://arxiv.org/html/2504.03083v1">arXiv:2504.03083</a>).
       The block structure could allow per-block gradient computation on-chip,
