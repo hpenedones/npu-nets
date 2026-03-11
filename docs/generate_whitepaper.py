@@ -162,13 +162,20 @@ algorithm directly to the physical hardware.
 <strong>TileFlow</strong> takes this literally. We design a neural network whose
 architecture is dictated by the physical tile layout of the AMD XDNA&nbsp;2
 <a href="#g-npu" class="gref">NPU</a>. The network has learnable parameters
-(a shared weight matrix) and non-linearities
-(<a href="#g-relu" class="gref">ReLU</a>), making it a valid machine-learning
-model &mdash; but its structure (number of parallel paths, loop depth, buffer
-sizes) matches the hardware exactly. The result is <strong>23.93
-<a href="#g-tflops" class="gref">TFLOPS</a></strong> sustained throughput
-&mdash; 95.7% of the 25 TFLOPS theoretical peak and a <strong>26&times; speedup
-over CPU</strong>.
+and non-linearities (<a href="#g-relu" class="gref">ReLU</a>), but its structure
+(number of layers, block grouping, buffer sizes) matches the hardware exactly.
+</p>
+
+<p>
+Our main result is a <strong>block-recurrent character language model</strong>
+with 32 layers grouped into 8 blocks of 4. Each block maps to a 4-stage pipeline
+on the NPU (one layer per compute row, 8 columns in parallel). The model achieves
+validation loss 2.42 (perplexity 11.2) on Shakespeare text and generates
+89,600 characters/second on the NPU. In a supporting throughput benchmark,
+a recurrent <a href="#g-mlp" class="gref">MLP</a> with a single shared weight
+achieves <strong>23.93 <a href="#g-tflops" class="gref">TFLOPS</a></strong>
+sustained &mdash; 95.7% of the 25 TFLOPS theoretical peak and
+<strong>26&times; speedup over CPU</strong>.
 </p>
 
 <div class="key-insight">
@@ -581,18 +588,18 @@ achieves only 2.49 TFLOPS on the NPU (10% of peak) because it is
 wins when data <strong>stays on-chip</strong>.
 </div>
 
-<h2>4. The Architecture: Recurrent MLP</h2>
+<h2>4. The Architecture</h2>
+
+<h3>4.1 Throughput benchmark: Recurrent MLP</h3>
 
 <p>
-We choose a recurrent <a href="#g-mlp" class="gref">MLP</a>: a single weight
-matrix <code>W</code> (128&times;128, <a href="#g-bf16" class="gref">bfloat16</a>)
-is loaded once into each tile's <a href="#g-sram" class="gref">SRAM</a> and
-applied repeatedly in a tight hardware loop. A <strong>fused
-<a href="#v-kernel" class="gref">kernel</a></strong> computes
-C&nbsp;=&nbsp;<a href="#g-relu" class="gref">ReLU</a>(A&nbsp;&times;&nbsp;B)
-in a single call &mdash; zero-initialising accumulators in
-<a href="#v-register" class="gref">registers</a>, performing the matmul, and
-applying the activation before writing back to SRAM:
+Our first architecture is a recurrent <a href="#g-mlp" class="gref">MLP</a>:
+a single weight matrix <code>W</code> (128&times;128,
+<a href="#g-bf16" class="gref">bfloat16</a>) is loaded once into each tile's
+<a href="#g-sram" class="gref">SRAM</a> and applied repeatedly in a tight
+hardware loop. A <strong>fused <a href="#v-kernel" class="gref">kernel</a></strong>
+computes C&nbsp;=&nbsp;<a href="#g-relu" class="gref">ReLU</a>(A&nbsp;&times;&nbsp;B)
+in a single call:
 </p>
 
 <pre>
@@ -618,7 +625,36 @@ same loop independently on different input samples:
   </div>
 </div>
 
-<h3>4.1 Why this architecture</h3>
+<h3>4.2 Main model: Block-Recurrent Character LM</h3>
+
+<p>
+The recurrent MLP demonstrates near-peak throughput but uses a single shared weight
+matrix &mdash; too simple for a real ML task. The <strong>block-recurrent</strong>
+architecture extends this with 32 <em>distinct</em> weight matrices, grouped into
+8 blocks of 4 layers. Each block maps to one NPU pipeline call (4 rows in one column).
+Between blocks, the CPU applies normalization, embedding injection, and residual
+connections:
+</p>
+
+<pre>
+for each character:
+    for each block g = 0..7:
+        CPU:  h_b = RMSNorm(h) + embed(char) + bias_g
+        NPU:  h_b = ReLU(ReLU(ReLU(ReLU(h_b @ W[4g]) @ W[4g+1]) @ W[4g+2]) @ W[4g+3])
+        CPU:  h = h + h_b   (residual connection)
+    CPU:  h = RMSNorm(h)       (post-norm)
+    CPU:  logits = h @ W_out + b_out
+</pre>
+
+<p>
+This design is a deliberate trade-off: per-layer normalization and input injection
+(which cannot run on the NPU pipeline) would give better quality (val loss 1.94)
+but require CPU intervention between every matmul. The blocked design sacrifices
+some quality (val loss 2.42) for exact NPU mapping &mdash; within each block,
+the 4-stage matmul+ReLU chain executes entirely in tile SRAM with no DDR traffic.
+</p>
+
+<h3>4.3 Why these architectures</h3>
 
 <ul>
   <li><strong>Maximizes on-chip time:</strong> Weight is loaded once (32 KB) and
@@ -635,7 +671,7 @@ same loop independently on different input samples:
       with no communication overhead.</li>
 </ul>
 
-<h3>4.2 Multi-row data routing</h3>
+<h3>4.4 Multi-row data routing</h3>
 
 <p>
 When using more than 8 tiles (i.e., more than one compute row), data must pass
@@ -659,7 +695,7 @@ At 3 compute rows = 9 streams, this fits; at 4 rows = 12 streams, the MLIR-AIE
 router fails. This caps us at <strong>24 tiles</strong> (3 rows &times; 8 columns).
 </div>
 
-<h3>4.3 Critical implementation constraints</h3>
+<h3>4.5 Critical implementation constraints</h3>
 
 <p>
 Several non-obvious hardware constraints shaped the design:
@@ -721,7 +757,44 @@ All measurements use 24 tiles (3 rows &times; 8 columns), H=128, depth=1000,
 <a href="#g-bf16" class="gref">bfloat16</a>.
 </p>
 
-<h3>5.1 Optimisation analysis</h3>
+<h3>5.2 Character language model</h3>
+
+<p>
+The block-recurrent char LM was trained on the tiny Shakespeare dataset (1.1 MB)
+for 10 epochs on a GPU, then run on the NPU:
+</p>
+
+<table>
+  <tr><th>Model</th><th>Params</th><th>Val Loss</th><th>Perplexity</th><th>Device</th></tr>
+  <tr style="background:#d4edda;font-weight:600;">
+      <td>Block-recurrent (8&times;4 pipeline)</td>
+      <td>542K</td><td>2.42</td><td>11.2</td><td>NPU (32 tiles)</td></tr>
+  <tr><td>Per-layer recurrent (norm every layer)</td>
+      <td>542K</td><td>1.94</td><td>6.9</td><td>CPU/GPU only</td></tr>
+  <tr><td>Transformer baseline</td>
+      <td>818K</td><td>1.89</td><td>6.6</td><td>GPU</td></tr>
+</table>
+
+<p>
+NPU inference performance for the block-recurrent model:
+</p>
+
+<table>
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td>NPU calls per character</td><td>8 (one per 4-layer block)</td></tr>
+  <tr><td>Latency per NPU call</td><td>0.14 ms</td></tr>
+  <tr><td>Throughput (1 sequence)</td><td>233 chars/s</td></tr>
+  <tr><td>Throughput (384 parallel sequences)</td><td>89,600 chars/s</td></tr>
+</table>
+
+<p>
+The quality gap between the blocked and per-layer models (2.42 vs 1.94) reflects
+the cost of grouping layers: inter-layer normalization and input injection help
+gradient flow and information access, but they require CPU intervention that breaks
+the NPU pipeline. This is the fundamental hardware&ndash;quality trade-off.
+</p>
+
+<h3>5.3 Optimisation analysis (throughput benchmark)</h3>
 
 <p>
 Two independent levers drove the improvement from 8.98 to 23.93 TFLOPS:
@@ -763,7 +836,7 @@ The compiler needs enough outer-loop iterations to schedule the additional
 fused operations into the pipeline.
 </div>
 
-<h3>5.2 Remaining gap to peak</h3>
+<h3>5.4 Remaining gap to peak</h3>
 
 <p>
 At 95.7% of the 25 TFLOPS theoretical peak, the remaining 4.3% (~1.1 TFLOPS)
@@ -815,16 +888,23 @@ The project is intentionally minimal &mdash; four Python files and two C++ files
 
 <table>
   <tr><th>File</th><th>Lines</th><th>Purpose</th></tr>
+  <tr><td><code>char_lm/model.py</code></td><td>~210</td>
+      <td>Block-recurrent character LM (RecurrentCharLM)</td></tr>
+  <tr><td><code>char_lm/train.py</code></td><td>~250</td>
+      <td>GPU training loop (ROCm / CUDA), spectral norm clamping</td></tr>
+  <tr><td><code>char_lm/generate.py</code></td><td>~215</td>
+      <td>Text generation on CPU or NPU</td></tr>
+  <tr><td><code>char_lm/data.py</code></td><td>~80</td>
+      <td>Shakespeare dataset and vocabulary</td></tr>
+  <tr><td><code>char_lm/transformer_baseline.py</code></td><td>~240</td>
+      <td>GPT-style reference model for quality comparison</td></tr>
   <tr><td><code>spatial_mlp/__init__.py</code></td><td>~55</td>
       <td>Tiling utilities (<code>to_tiled</code>, <code>from_tiled</code>)</td></tr>
-  <tr><td><code>spatial_mlp/design.py</code></td><td>~400</td>
-      <td><a href="#g-iron" class="gref">IRON</a> design: tile topology,
-          <a href="#g-fifo" class="gref">FIFOs</a>, workers,
-          <a href="#g-dma" class="gref">DMA</a></td></tr>
-  <tr><td><code>spatial_mlp/op.py</code></td><td>~145</td>
-      <td>IRON operator: compilation artifacts, runtime buffers</td></tr>
-  <tr><td><code>spatial_mlp/test.py</code></td><td>~336</td>
-      <td>Benchmark: NPU vs CPU execution and reporting</td></tr>
+  <tr><td><code>spatial_mlp/pipeline_design.py</code></td><td>~290</td>
+      <td><a href="#g-iron" class="gref">IRON</a> design: 32-tile pipeline
+          (8 cols &times; 4 rows)</td></tr>
+  <tr><td><code>spatial_mlp/pipeline_op.py</code></td><td>~130</td>
+      <td>IRON operator: compilation + runtime buffers</td></tr>
   <tr><td><code>aie_kernels/matmul_relu.cc</code></td><td>~125</td>
       <td>Fused C&nbsp;=&nbsp;ReLU(A&nbsp;&times;&nbsp;B)
           <a href="#v-kernel" class="gref">kernel</a> for
@@ -834,31 +914,32 @@ The project is intentionally minimal &mdash; four Python files and two C++ files
 </table>
 
 <p>
-Each module has a single, well-defined responsibility. The design module is
-decomposed into small functions that each handle one aspect of the hardware
-mapping: validation, kernel definition, FIFO topology, worker bodies, tensor
-access patterns, and DMA sequences.
+The character LM module (<code>char_lm/</code>) handles training and generation.
+The spatial MLP module (<code>spatial_mlp/</code>) provides the NPU pipeline
+infrastructure used by the generator for on-device inference.
 </p>
 
 <h2>8. Future Work</h2>
 
 <ul>
-  <li><strong>32-tile routing:</strong> Our current design uses 24 of 32
-      tiles due to MemTile routing constraints (~6 northward master ports).
-      Alternative routing strategies or future compiler improvements could
-      unlock the remaining 8 tiles for a potential ~33% throughput increase.</li>
+  <li><strong>Close the quality gap:</strong> The blocked model (val loss 2.42)
+      lags the per-layer model (1.94) because normalization and input injection
+      happen only between blocks, not between every layer. Custom NPU kernels
+      that fuse norm+matmul+ReLU could enable per-layer operations within the
+      pipeline, recovering quality without sacrificing NPU mapping.</li>
   <li><strong><a href="#g-int8" class="gref">INT8</a> mode:</strong> The
       NPU&rsquo;s peak is 50 <a href="#g-tops" class="gref">TOPS</a> for
       int8 &mdash; double the bf16 rate. With quantization-aware training, this
-      could push effective throughput to ~48 TOPS.</li>
+      could push effective throughput to ~48 TOPS and allow H=256 (fitting in
+      the same SRAM budget).</li>
   <li><strong>Training on NPU:</strong> Research NPU backpropagation
       (see <a href="https://arxiv.org/html/2504.03083v1">arXiv:2504.03083</a>).
-      The recurrent architecture&rsquo;s weight sharing means only one weight
-      gradient needs to be accumulated, making backprop simpler than in a
-      typical deep network.</li>
-  <li><strong>Real ML task:</strong> Apply the architecture to a concrete
-      sequence modelling or time-series task where deep recurrence is natural
-      (e.g., character-level language modelling, dynamical systems).</li>
+      The block structure could allow per-block gradient computation on-chip,
+      with CPU handling the cross-block gradient flow.</li>
+  <li><strong>Larger tasks:</strong> Apply the block-recurrent architecture to
+      longer text datasets, music generation, or time-series forecasting where
+      deep recurrence is natural and the NPU throughput advantage compounds
+      over long sequences.</li>
 </ul>
 
 <h2>References</h2>

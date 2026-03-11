@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-Recurrent character-level language model.
+Recurrent character-level language model designed to map exactly to NPU.
 
 Architecture (per character step):
-    1. Embedding:  char index  →  128-dim vector  e                   (CPU)
-    2. Recurrence: for each layer i = 0..num_layers-1:                (NPU)
-                       h = h + ReLU(RMSNorm(h) @ W_i + e + b_i)
-    3. Normalise:  h = RMSNorm(h)                                     (CPU)
-    4. Readout:    h  →  logits over vocabulary                       (CPU)
+    for each block g = 0..num_blocks-1:
+        1. Pre-norm:   h_b = RMSNorm(h)                               (CPU)
+        2. Injection:  h_b = h_b + embed(char) + bias_g               (CPU)
+        3. Block:      h_b = ReLU(..ReLU(h_b @ W[4g]) @ W[4g+1]..)   (NPU)
+        4. Residual:   h = h + h_b                                    (CPU)
+    5. Post-norm:  h = RMSNorm(h)                                     (CPU)
+    6. Readout:    logits = h @ W_out + b_out                         (CPU)
 
-The input embedding is injected at every layer (not just once), giving
-each layer direct access to the current character.  Pre-layer RMSNorm
-prevents hidden-state explosion through deep residual chains.
+Each block of 4 layers is a pure matmul+ReLU chain that runs entirely on
+the NPU pipeline (4 stages per column, 8 columns in parallel = 32 tiles).
+CPU handles normalisation, input injection, bias, and residual connections
+between blocks — exactly matching what it does between NPU calls.
 
-With num_layers=1 this is a weight-tied recurrent net (same W every step).
-With num_layers>1, each layer has its own W and b — giving more parameters
-while reusing the same NPU design (one NPU call per layer per character).
+With block_size=4 and num_layers=32: 8 blocks = 8 NPU calls per character.
 """
 
 import torch
@@ -38,7 +39,7 @@ class RMSNorm(nn.Module):
 
 
 class RecurrentCharLM(nn.Module):
-    """Character-level language model with recurrent core.
+    """Character-level language model with block-recurrent core.
 
     Parameters
     ----------
@@ -46,36 +47,45 @@ class RecurrentCharLM(nn.Module):
         Number of distinct characters.
     hidden_size : int
         Dimension of the hidden state and weight matrices (multiple of 8).
-    depth : int
-        Total ReLU iterations per character, split across layers.
-    bptt_depth : int
-        How many of the final iterations carry gradients (truncated BPTT).
     num_layers : int
-        Number of distinct weight matrices.  depth is divided evenly.
+        Number of distinct weight matrices (must be divisible by block_size).
+    block_size : int
+        Layers per block.  Each block is a pure matmul+ReLU chain that
+        maps to one NPU pipeline call (default: 4 = STAGES_PER_COL).
+    bptt_blocks : int
+        How many of the final blocks carry gradients (truncated BPTT).
+        Default: all blocks.
     """
 
     def __init__(
         self,
         vocab_size: int,
         hidden_size: int = 128,
-        depth: int = 500,
-        bptt_depth: int = 20,
-        num_layers: int = 1,
+        num_layers: int = 32,
+        block_size: int = 4,
+        bptt_blocks: int | None = None,
     ):
         super().__init__()
+        assert num_layers % block_size == 0, (
+            f"num_layers={num_layers} must be divisible by block_size={block_size}")
         self.hidden_size = hidden_size
-        self.depth = depth
-        self.bptt_depth = bptt_depth
         self.num_layers = num_layers
+        self.block_size = block_size
+        self.num_blocks = num_layers // block_size
+        self.bptt_blocks = bptt_blocks if bptt_blocks is not None else self.num_blocks
+
+        # Keep depth/bptt_depth for checkpoint compatibility
+        self.depth = num_layers
+        self.bptt_depth = self.bptt_blocks * block_size
 
         self.embed = nn.Embedding(vocab_size, hidden_size)
         self.weights = nn.ParameterList([
             nn.Parameter(torch.empty(hidden_size, hidden_size))
             for _ in range(num_layers)
         ])
-        self.biases = nn.ParameterList([
+        self.block_biases = nn.ParameterList([
             nn.Parameter(torch.zeros(hidden_size))
-            for _ in range(num_layers)
+            for _ in range(self.num_blocks)
         ])
         self.pre_norm = RMSNorm(hidden_size)
         self.post_norm = RMSNorm(hidden_size)
@@ -85,46 +95,50 @@ class RecurrentCharLM(nn.Module):
 
     @property
     def depth_per_layer(self) -> int:
-        return self.depth // self.num_layers
+        return 1
 
     def _init_weights(self):
-        """Initialise weights for stable deep recurrence.
-
-        Each W is orthogonal, scaled by 1/sqrt(num_layers) so the
-        cumulative residual additions stay bounded.  Biases start at zero.
-        """
+        """Initialise weights for stable deep recurrence."""
         for W in self.weights:
             nn.init.orthogonal_(W)
-            W.data.mul_(1.0 / (self.num_layers ** 0.5))
+            W.data.mul_(1.0 / (self.num_blocks ** 0.5))
         nn.init.normal_(self.embed.weight, std=0.02)
         nn.init.xavier_uniform_(self.readout.weight)
         nn.init.zeros_(self.readout.bias)
 
+    def _apply_block(self, h_block: torch.Tensor, block_idx: int) -> torch.Tensor:
+        """Apply one block of pure matmul+ReLU layers (NPU-compatible)."""
+        start = block_idx * self.block_size
+        for i in range(start, start + self.block_size):
+            h_block = F.relu(h_block @ self.weights[i])
+        return h_block
+
     def _apply_recurrence(
         self, h: torch.Tensor, embed: torch.Tensor
     ) -> torch.Tensor:
-        """Apply all layers sequentially with truncated BPTT.
+        """Apply all blocks with truncated BPTT.
 
-        Each layer: h = h + ReLU(RMSNorm(h) @ W_i + embed + b_i).
-        The embedding is injected at every layer so each one sees the
-        current character directly.  Pre-norm keeps h bounded.
-        Only the last bptt_depth iterations carry gradients.
+        Each block:
+            h_b = pre_norm(h) + embed + bias
+            h_b = ReLU(..ReLU(h_b @ W0) @ W1 ..)  [block_size layers]
+            h = h + h_b
+
+        Only the last bptt_blocks blocks carry gradients.
         """
-        dpl = self.depth_per_layer
-        total_iters = dpl * self.num_layers
-        no_grad_iters = total_iters - self.bptt_depth
+        no_grad_blocks = self.num_blocks - self.bptt_blocks
 
-        iter_count = 0
-        for W, b in zip(self.weights, self.biases):
-            for _ in range(dpl):
-                if iter_count < no_grad_iters:
-                    with torch.no_grad():
-                        h = h + F.relu(self.pre_norm(h) @ W + embed + b)
-                else:
-                    if iter_count == no_grad_iters:
-                        h = h.detach().requires_grad_(True)
-                    h = h + F.relu(self.pre_norm(h) @ W + embed + b)
-                iter_count += 1
+        for g in range(self.num_blocks):
+            if g < no_grad_blocks:
+                with torch.no_grad():
+                    h_block = self.pre_norm(h) + embed + self.block_biases[g]
+                    h_block = self._apply_block(h_block, g)
+                    h = h + h_block
+            else:
+                if g == no_grad_blocks:
+                    h = h.detach().requires_grad_(True)
+                h_block = self.pre_norm(h) + embed + self.block_biases[g]
+                h_block = self._apply_block(h_block, g)
+                h = h + h_block
 
         return h
 
@@ -189,7 +203,7 @@ class RecurrentCharLM(nn.Module):
     def count_parameters(self) -> dict[str, int]:
         """Return parameter counts by component."""
         recurrent_w = sum(W.numel() for W in self.weights)
-        recurrent_b = sum(b.numel() for b in self.biases)
+        recurrent_b = sum(b.numel() for b in self.block_biases)
         return {
             "embedding": self.embed.weight.numel(),
             "recurrent_W": recurrent_w,

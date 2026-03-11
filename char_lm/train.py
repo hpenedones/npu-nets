@@ -109,10 +109,10 @@ def save_checkpoint(
             "model_state": {k: v.cpu() for k, v in model.state_dict().items()},
             "vocab_chars": vocab.chars,
             "hidden_size": model.hidden_size,
-            "depth": model.depth,
-            "bptt_depth": model.bptt_depth,
             "num_layers": model.num_layers,
-            "vocab_size": vocab.size,
+            "block_size": model.block_size,
+            "bptt_blocks": model.bptt_blocks,
+            "vocab_size": len(vocab.chars),
             **metadata,
         },
         path,
@@ -124,11 +124,11 @@ def load_checkpoint(path: Path) -> tuple[RecurrentCharLM, Vocabulary]:
     ckpt = torch.load(path, weights_only=False)
     vocab = Vocabulary(ckpt["vocab_chars"])
     model = RecurrentCharLM(
-        vocab_size=ckpt["vocab_size"],
+        vocab_size=ckpt.get("vocab_size", len(vocab.chars)),
         hidden_size=ckpt["hidden_size"],
-        depth=ckpt["depth"],
-        bptt_depth=ckpt["bptt_depth"],
-        num_layers=ckpt.get("num_layers", 1),
+        num_layers=ckpt["num_layers"],
+        block_size=ckpt.get("block_size", 4),
+        bptt_blocks=ckpt.get("bptt_blocks", None),
     )
     model.load_state_dict(ckpt["model_state"])
     return model, vocab
@@ -136,14 +136,14 @@ def load_checkpoint(path: Path) -> tuple[RecurrentCharLM, Vocabulary]:
 
 def main():
     parser = argparse.ArgumentParser(description="Train character LM")
-    parser.add_argument("--depth", type=int, default=500,
-                        help="Recurrence depth per character (default: 500)")
-    parser.add_argument("--bptt-depth", type=int, default=20,
-                        help="Backprop-through-time depth (default: 20)")
+    parser.add_argument("--num-layers", type=int, default=32,
+                        help="Number of weight matrices (default: 32)")
+    parser.add_argument("--block-size", type=int, default=4,
+                        help="Layers per block / NPU pipeline stages (default: 4)")
+    parser.add_argument("--bptt-blocks", type=int, default=None,
+                        help="Blocks with gradients, None=all (default: all)")
     parser.add_argument("--hidden-size", type=int, default=128,
                         help="Hidden dimension (default: 128)")
-    parser.add_argument("--num-layers", type=int, default=1,
-                        help="Number of distinct W matrices (default: 1)")
     parser.add_argument("--seq-len", type=int, default=64,
                         help="Training sequence length (default: 64)")
     parser.add_argument("--batch-size", type=int, default=32,
@@ -189,18 +189,21 @@ def main():
     model = RecurrentCharLM(
         vocab_size=vocab.size,
         hidden_size=args.hidden_size,
-        depth=args.depth,
-        bptt_depth=args.bptt_depth,
         num_layers=args.num_layers,
+        block_size=args.block_size,
+        bptt_blocks=args.bptt_blocks,
     )
     params = model.count_parameters()
-    print(f"Model parameters:")
+    print(f"Model: {args.num_layers} layers, "
+          f"{model.num_blocks} blocks of {args.block_size}, "
+          f"hidden={args.hidden_size}")
+    print(f"Parameters:")
     print(f"  Embedding:    {params['embedding']:,}")
-    print(f"  Recurrent W:  {params['recurrent_W']:,} ({params['num_layers']} layer(s) × {args.hidden_size}²)")
-    print(f"  Recurrent b:  {params['recurrent_b']:,}")
+    print(f"  Recurrent W:  {params['recurrent_W']:,}")
+    print(f"  Block biases: {params['recurrent_b']:,}")
     print(f"  Readout:      {params['readout']:,}")
     print(f"  Total:        {params['total']:,}")
-    print(f"  Depth:        {args.depth} ({model.depth_per_layer}/layer, {args.bptt_depth} with gradients)")
+    print(f"  BPTT blocks:  {model.bptt_blocks}/{model.num_blocks}")
     print()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
