@@ -211,3 +211,59 @@ def load_wikipedia(
 
     print(f"Wikipedia: {len(raw_text):,} raw chars → {len(encoded):,} encoded chars")
     return train_ds, val_ds, vocab
+
+
+def _clean_ascii(text: str) -> str:
+    """Strip non-printable-ASCII, keeping newline and space through tilde."""
+    return re.sub(r'[^\x0a\x20-\x7e]', '', text)
+
+
+def load_dolly(seq_len: int = 64, val_fraction: float = 0.1):
+    """Load Databricks Dolly-15k and return train/val datasets + vocabulary.
+
+    Each example is formatted as::
+
+        Q: <instruction>
+        A: <response>
+
+    When a context is provided it is appended to the question.
+    The full corpus is concatenated with blank-line separators.
+    """
+    from datasets import load_dataset
+
+    cache_path = DATA_DIR / "dolly_qa.txt"
+
+    if cache_path.exists():
+        print(f"Loading cached Dolly text from {cache_path}")
+        raw_text = cache_path.read_text()
+    else:
+        print("Downloading Dolly-15k (first time only)...")
+        ds = load_dataset(
+            "databricks/databricks-dolly-15k", split="train", trust_remote_code=True
+        )
+
+        parts: list[str] = []
+        for row in ds:
+            q = _clean_ascii(row["instruction"].strip())
+            a = _clean_ascii(row["response"].strip())
+            ctx = _clean_ascii(row.get("context", "").strip())
+            if not q or not a:
+                continue
+            if ctx:
+                q = f"{q}\n{ctx}"
+            parts.append(f"Q: {q}\nA: {a}")
+
+        raw_text = "\n\n".join(parts)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(raw_text)
+        print(f"Cached {len(raw_text):,} chars to {cache_path}")
+
+    vocab = Vocabulary.from_text(raw_text)
+    encoded = shift_encode(raw_text)
+
+    split = int(len(encoded) * (1 - val_fraction))
+    train_ds = SequenceDataset(encoded[:split], vocab, seq_len)
+    val_ds = SequenceDataset(encoded[split:], vocab, seq_len)
+
+    print(f"Dolly: {len(raw_text):,} raw chars → {len(encoded):,} encoded chars")
+    return train_ds, val_ds, vocab

@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 
-from char_lm.data import load_shakespeare, load_wikipedia, Vocabulary
+from char_lm.data import load_shakespeare, load_wikipedia, load_dolly, Vocabulary
 
 CHECKPOINT_DIR = Path(__file__).parent.parent / "data"
 
@@ -126,7 +126,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--dataset", type=str, default="shakespeare",
-                        choices=["shakespeare", "wikipedia"])
+                        choices=["shakespeare", "wikipedia", "dolly"])
     parser.add_argument("--wiki-chars", type=int, default=10_000_000,
                         help="Max raw chars for wikipedia dataset (default: 10M)")
     parser.add_argument("--device", type=str, default="auto")
@@ -147,6 +147,8 @@ def main():
     if args.dataset == "wikipedia":
         train_ds, val_ds, vocab = load_wikipedia(
             seq_len=args.seq_len, max_chars=args.wiki_chars)
+    elif args.dataset == "dolly":
+        train_ds, val_ds, vocab = load_dolly(seq_len=args.seq_len)
     else:
         train_ds, val_ds, vocab = load_shakespeare(seq_len=args.seq_len)
 
@@ -296,6 +298,8 @@ def main():
     print("=" * 60)
     if args.dataset == "wikipedia":
         prompt = "\n= Albert Einstein =\n"
+    elif args.dataset == "dolly":
+        prompt = "Q: What is the capital of France?\nA:"
     else:
         prompt = "\nTo be, or not to be"
     prompt_ids = torch.tensor([vocab.encode(prompt)], device=device)

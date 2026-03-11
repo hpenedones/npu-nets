@@ -21,7 +21,7 @@ from pathlib import Path
 
 import mlflow
 
-from char_lm.data import load_shakespeare, load_wikipedia, Vocabulary
+from char_lm.data import load_shakespeare, load_wikipedia, load_dolly, Vocabulary
 from char_lm.model import RecurrentCharLM
 
 CHECKPOINT_DIR = Path(__file__).parent.parent / "data"
@@ -167,7 +167,7 @@ def main():
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clipping norm (default: 1.0)")
     parser.add_argument("--dataset", type=str, default="shakespeare",
-                        choices=["shakespeare", "wikipedia"],
+                        choices=["shakespeare", "wikipedia", "dolly"],
                         help="Dataset to train on (default: shakespeare)")
     parser.add_argument("--wiki-chars", type=int, default=10_000_000,
                         help="Max raw chars for wikipedia dataset (default: 10M)")
@@ -193,6 +193,8 @@ def main():
         train_ds, val_ds, vocab = load_wikipedia(
             seq_len=args.seq_len, max_chars=args.wiki_chars
         )
+    elif args.dataset == "dolly":
+        train_ds, val_ds, vocab = load_dolly(seq_len=args.seq_len)
     else:
         train_ds, val_ds, vocab = load_shakespeare(seq_len=args.seq_len)
     train_loader = DataLoader(
@@ -306,6 +308,8 @@ def main():
     model_cpu, vocab = load_checkpoint(ckpt_path)
     if args.dataset == "wikipedia":
         prompt = "\n= Albert Einstein =\n"
+    elif args.dataset == "dolly":
+        prompt = "Q: What is the capital of France?\nA:"
     else:
         prompt = "\nTo be, or not to be"
     prompt_ids = torch.tensor([vocab.encode(prompt)])
