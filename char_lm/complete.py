@@ -8,10 +8,12 @@ Usage::
     python -m char_lm.complete                         # latest checkpoint
     python -m char_lm.complete --checkpoint data/wikipedia_transformer_checkpoint.pt
     python -m char_lm.complete --chars 500 --temperature 0.6
+    python -m char_lm.complete --benchmark             # measure chars/s
 """
 
 import argparse
 import sys
+import time
 import torch
 from pathlib import Path
 
@@ -54,6 +56,39 @@ def load_any_checkpoint(path: Path):
     return model, vocab, kind
 
 
+def run_benchmark(model, vocab, kind, num_chars=500, num_warmup=50):
+    """Measure inference throughput in characters/second."""
+    device = next(model.parameters()).device
+    # Use a fixed prompt (lowercase to avoid shift-encoding issues)
+    prompt = "the "
+    prompt_ids = torch.tensor([vocab.encode(prompt)], device=device)
+
+    # Warmup
+    print(f"Warming up ({num_warmup} chars)...")
+    _ = model.generate(prompt_ids, num_chars=num_warmup, temperature=0.8)
+
+    # Timed run
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    print(f"Generating {num_chars} chars...")
+    t0 = time.perf_counter()
+    _ = model.generate(prompt_ids, num_chars=num_chars, temperature=0.8)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+
+    chars_per_sec = num_chars / elapsed
+    ms_per_char = elapsed / num_chars * 1000
+    print(f"\n{'='*50}")
+    print(f"Model:      {kind}")
+    print(f"Device:     {device}")
+    print(f"Generated:  {num_chars} characters")
+    print(f"Time:       {elapsed:.3f}s")
+    print(f"Throughput: {chars_per_sec:,.0f} chars/s")
+    print(f"Latency:    {ms_per_char:.2f} ms/char")
+    print(f"{'='*50}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Interactive char LM completion")
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -62,6 +97,10 @@ def main():
                         help="Characters to generate (default: 200)")
     parser.add_argument("--temperature", type=float, default=0.8,
                         help="Sampling temperature (default: 0.8)")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Measure inference throughput (chars/s)")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Force device (cpu/cuda)")
     args = parser.parse_args()
 
     if args.checkpoint:
@@ -91,10 +130,24 @@ def main():
 
     model, vocab, kind = load_any_checkpoint(ckpt_path)
     model.eval()
+
+    # Device selection
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
     params = sum(p.numel() for p in model.parameters())
     print(f"Loaded: {kind}, {params:,} params")
     print(f"Checkpoint: {ckpt_path.name}")
+    print(f"Device: {device}")
     print(f"Vocab: {vocab.size} characters")
+
+    if args.benchmark:
+        run_benchmark(model, vocab, kind, num_chars=args.chars)
+        return
+
     print(f"Type a prompt and press Enter. Ctrl-C to quit.\n")
 
     try:

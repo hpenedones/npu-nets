@@ -1397,6 +1397,42 @@ Every architectural choice follows from a hardware constraint:
       <a href="#g-xrt" class="gref">XRT</a> driver overhead per NPU call.</li>
 </ul>
 
+<div class="highlight">
+<strong>Why not B=1 with a larger hidden dimension?</strong>
+<p>
+A natural question: could each column process a <em>single</em> sequence
+(B=1) and use the freed SRAM for a larger weight matrix? There are three
+reasons this does not work:
+</p>
+<ol>
+  <li><strong>Hardware minimum:</strong> The
+      <a href="#g-mmul" class="gref">MMUL</a> unit processes 2r=16 rows per
+      output block. The kernel has <code>static_assert(DIM_M % 16 == 0)</code>,
+      so B=1 will not compile. The hard minimum is B=16.</li>
+  <li><strong>Pipelining:</strong> The chess compiler pipelines the matmul outer
+      loop, which has M/(2r) iterations. At B=16 that is just 1 iteration
+      &mdash; no pipeline fill, no overlap between load and compute.
+      B=48 gives 3 iterations, the minimum for the compiler to pipeline
+      effectively.</li>
+  <li><strong>SRAM still limits H:</strong> Even at B=1, the weight matrix
+      alone is H&times;H&times;2 bytes. H=192 needs 72 KB &gt; 64 KB.
+      The maximum reachable is H&asymp;176 &mdash; only 37% more parameters per
+      layer, while losing 48&times; the batch throughput.</li>
+</ol>
+<p>
+The batch dimension is what fills the systolic array. With B=1 (padded to 16),
+15 of every 16 rows are wasted. One matmul does 32K useful FLOPs instead of
+1.57M &mdash; a 48&times; efficiency loss. At that point a CPU is equally fast.
+</p>
+<p>
+An alternative approach would be to <em>shard</em> a large weight matrix
+across multiple tiles (e.g., H=512 split into four 512&times;128 slices).
+This requires horizontal communication between tiles for partial-sum
+reduction, which the current column topology does not support. Exploring
+such <em>model-parallel</em> layouts is future work.
+</p>
+</div>
+
 <h3>5.4 Fusing normalisation into the pipeline</h3>
 
 <p>
@@ -1499,8 +1535,31 @@ The model produces recognisable Shakespearean English with a 542K-parameter
 model trained on 1 MB of text.
 </p>
 
-<h3>6.2 NPU inference performance</h3>
+<h3>6.2 Inference performance</h3>
 
+<h4>Throughput comparison (single-sequence autoregressive generation)</h4>
+<table>
+  <tr><th>Model</th><th>Device</th><th>chars/s</th><th>ms/char</th></tr>
+  <tr><td>Recurrent 64L (1M params)</td><td>CPU</td>
+      <td><strong>1,065</strong></td><td>0.94</td></tr>
+  <tr><td>Transformer 4L (818K params)</td><td>CPU</td>
+      <td>775</td><td>1.29</td></tr>
+  <tr><td>NPU block-recurrent 32L (542K params)</td><td>NPU &times;1 seq</td>
+      <td>233</td><td>4.29</td></tr>
+  <tr><td>Transformer 4L (818K params)</td><td>GPU</td>
+      <td>187</td><td>5.35</td></tr>
+  <tr><td>Recurrent 64L (1M params)</td><td>GPU</td>
+      <td>92</td><td>10.90</td></tr>
+</table>
+
+<p>
+For a single sequence, the CPU is fastest. The models are too small
+(&lt;&nbsp;1M parameters) to saturate the GPU&rsquo;s compute units, so GPU
+kernel launch overhead dominates. The NPU likewise loses on single-sequence
+latency due to the ~120&nbsp;&mu;s XRT overhead per call.
+</p>
+
+<h4>NPU batched throughput</h4>
 <table>
   <tr><th>Metric</th><th>Value</th></tr>
   <tr><td>NPU tiles used</td><td>32 (8 columns &times; 4 rows)</td></tr>
@@ -1515,7 +1574,10 @@ model trained on 1 MB of text.
 <p>
 The 384-sequence throughput is the key figure: by processing 8&nbsp;columns
 &times; 48&nbsp;samples per column in parallel, we amortise the per-call
-overhead across hundreds of sequences. The CPU overhead between NPU calls
+overhead across hundreds of sequences. Compared to the CPU baseline
+(1,065&nbsp;chars/s for a single sequence), the NPU achieves
+<strong>84&times; higher total throughput</strong> when all 384 sequences
+are served simultaneously. The CPU overhead between NPU calls
 (embedding injection, bias addition, residual connection) is minimal since
 normalisation is now handled on-chip by the fused kernel.
 </p>
@@ -1530,19 +1592,48 @@ overhead (instruction dispatch, <a href="#g-dma" class="gref">DMA</a> setup),
 not compute. With 8 calls per character, that overhead adds up.
 </p>
 
+<h4>Utilisation arithmetic</h4>
 <p>
-This is fundamentally different from the throughput benchmark (see
-<code>logbook.md</code>), where a single NPU call ran 1000 loop iterations
-on-chip, making compute dominate overhead and achieving 95.7% of the 25
-<a href="#g-tflops" class="gref">TFLOPS</a> peak. The character LM trades
-peak utilisation for a richer, more useful architecture.
+Each character step (one character for all 384 sequences) requires:
+</p>
+<ul>
+  <li>8 NPU calls &times; 32 tiles &times; one matmul [48, 128, 128]</li>
+  <li>FLOPs per matmul: 2 &times; 48 &times; 128 &times; 128 = 1,572,864</li>
+  <li>Total per step: 8 &times; 32 &times; 1.57M = <strong>402.7M FLOPs</strong></li>
+</ul>
+<p>
+At 233 steps/s this is <strong>93.8 GFLOPS &mdash; only 0.38% of the 25 TFLOPS
+bf16 peak</strong>.
+</p>
+
+<table>
+  <tr><th>Budget item</th><th>Time</th><th>% of step</th></tr>
+  <tr><td>Pure MMUL compute (402.7M FLOPs &divide; 23.93 TFLOPS)</td>
+      <td>~17 &mu;s</td><td>0.4%</td></tr>
+  <tr><td>DMA + instruction dispatch (8 calls &times; ~0.14 ms)</td>
+      <td>~1.1 ms</td><td>26%</td></tr>
+  <tr><td>CPU overhead (embedding injection, residuals, softmax)</td>
+      <td>~3.1 ms</td><td>74%</td></tr>
+  <tr style="font-weight:600;"><td>Total per step</td>
+      <td>~4.3 ms</td><td>100%</td></tr>
+</table>
+
+<p>
+The <a href="#g-mmul" class="gref">MMUL</a> units are essentially idle.
+The bottleneck is entirely in the 8 round-trips between CPU and NPU per
+character.  This is fundamentally different from the throughput benchmark
+(see <code>logbook.md</code>), where a single NPU call ran 1000 loop
+iterations on-chip, making compute dominate overhead and achieving 95.7%
+of the 25 <a href="#g-tflops" class="gref">TFLOPS</a> peak.
 </p>
 
 <div class="key-insight">
-<strong>Insight:</strong> NPU utilisation is not the goal &mdash; building a
-useful model that runs on the NPU is. The architecture is designed for
-correctness of the hardware mapping; throughput optimisation (larger hidden
-dimensions, fewer blocks, quantisation) is future work.
+<strong>Insight:</strong> The current architecture proves the hardware mapping
+is correct but achieves only 0.4% of peak compute utilisation.
+The path to high utilisation is reducing the number of CPU&ndash;NPU round-trips
+per character: either by running all 8 blocks on-chip in a single NPU call
+(requires on-chip residual addition and embedding injection), or by switching
+to INT8 mode (doubling the compute/overhead ratio), or both.
 </div>
 
 <h2>7. The Toolchain</h2>
