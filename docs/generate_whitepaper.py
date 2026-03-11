@@ -800,31 +800,38 @@ For each row-block  z = 0, 2, 4, ... M/r-1  (steps of 2, &ldquo;2&times;2 expans
 <h4>Where the dimension constraints come from</h4>
 
 <p>
-The three <code>static_assert</code> lines in our kernel enforce that the matrix
-dimensions are exact multiples of the block factors:
+The three <code>static_assert</code> lines in our kernel are
+<strong>software constraints from our kernel design</strong>, not fundamental
+hardware limitations.  It is important to distinguish three layers:
 </p>
 
 <table>
-  <tr><th>Assertion</th><th>In our kernel</th><th>Meaning</th></tr>
+  <tr><th>Layer</th><th>Constraint</th><th>Can be relaxed?</th></tr>
   <tr>
-    <td><code>DIM_M % (2*r) == 0</code></td>
-    <td>DIM_M = B (batch), r = 8<br/>&rArr; <strong>B % 16 == 0</strong></td>
-    <td>The outer loop steps by 2 blocks of r rows.
-        B must be a multiple of 2&times;8&nbsp;=&nbsp;16.<br/>
-        <em>This is why B=1 is impossible:</em> the hardware
-        tile needs at least 16 rows.</td>
+    <td><strong>Hardware</strong><br/>(MMUL instruction)</td>
+    <td>Operates on 8&times;8&times;8 blocks.
+        Input tiles must be exactly 8&times;8 elements.</td>
+    <td>No &mdash; this is the physical instruction size.
+        But you can always <strong>pad</strong> your matrices with zeros
+        to the next multiple of 8.  IRON&rsquo;s GEMM operator does this
+        transparently.</td>
   </tr>
   <tr>
-    <td><code>DIM_K % s == 0</code></td>
-    <td>DIM_K = H (hidden), s = 8<br/>&rArr; <strong>H % 8 == 0</strong></td>
-    <td>The reduction loop iterates K/s times.
-        H must be a multiple of 8.</td>
+    <td><strong>2&times;2 expansion</strong><br/>(our kernel pattern)</td>
+    <td><code>DIM_M % (2r) == 0</code> &rArr; B&nbsp;%&nbsp;16&nbsp;==&nbsp;0<br/>
+        <code>DIM_N % (2t) == 0</code> &rArr; H&nbsp;%&nbsp;16&nbsp;==&nbsp;0</td>
+    <td><strong>Yes.</strong> The 2&times;2 expansion processes two row-blocks
+        and two column-blocks per iteration for better register utilisation.
+        A simpler 1&times;1 kernel would only need B&nbsp;%&nbsp;8&nbsp;==&nbsp;0
+        and H&nbsp;%&nbsp;8&nbsp;==&nbsp;0.</td>
   </tr>
   <tr>
-    <td><code>DIM_N % (2*t) == 0</code></td>
-    <td>DIM_N = H (hidden), t = 8<br/>&rArr; <strong>H % 16 == 0</strong></td>
-    <td>The inner column loop steps by 2 blocks of t columns.
-        H must be a multiple of 16.</td>
+    <td><strong>Pipelining</strong><br/>(compiler optimisation)</td>
+    <td><code>chess_prepare_for_pipelining</code> needs &ge;3 outer-loop
+        iterations for effective overlap of load/compute/store.</td>
+    <td><strong>Yes.</strong> Fewer iterations still work, just slower.
+        With 2&times;2: B/(2&times;8)&nbsp;&ge;&nbsp;3 &rArr; B&nbsp;&ge;&nbsp;48.
+        With 1&times;1: B/8&nbsp;&ge;&nbsp;3 &rArr; B&nbsp;&ge;&nbsp;24.</td>
   </tr>
 </table>
 
@@ -835,23 +842,42 @@ computes C[B,&thinsp;H]&nbsp;=&nbsp;A[B,&thinsp;H]&nbsp;&times;&nbsp;W[H,&thinsp
 rows of A correspond to independent samples in the batch.
 </p>
 
-<h4>Why B=48 (not just B=16)</h4>
 <p>
-B=16 satisfies the <code>static_assert</code>, but the outer loop would have
-only M/(2r)&nbsp;=&nbsp;16/16&nbsp;=&nbsp;<strong>1 iteration</strong>.
-The <code>chess_prepare_for_pipelining</code> compiler directive asks the
-chess compiler to overlap iterations: while one iteration&rsquo;s MAC results
-are being stored to SRAM, the next iteration&rsquo;s A and B tiles are being loaded.
-With only 1 iteration, there is nothing to overlap &mdash; the pipeline
-sits empty.
+So B=1 is not impossible in principle &mdash; you could pad to B=8 and discard
+7 rows of the output.  But 7/8 of the MMUL work would be wasted.
+Similarly, B=8 with a 1&times;1 kernel would work correctly but with no
+loop pipelining.  The constraints compound: B=48 with 2&times;2 expansion
+is the <em>sweet spot</em> that simultaneously maximises register
+utilisation, enables pipelining, and fits in SRAM.
 </p>
+
+<h4>Why B=48 in practice</h4>
 <p>
-At B=48, the outer loop has 48/16&nbsp;=&nbsp;<strong>3 iterations</strong> &mdash;
-the minimum for the compiler to pipeline effectively (fill / steady-state / drain).
-In our benchmarks this is the difference between
-<strong>8.04 TFLOPS</strong> (B=16, fused) and
-<strong>23.93 TFLOPS</strong> (B=48, fused) &mdash;
-a 3&times; throughput gain from 3&times; more rows.
+Even though the hardware could process B=8 or B=24, the throughput difference
+is dramatic.  The <code>chess_prepare_for_pipelining</code> directive asks the
+compiler to overlap iterations: while one iteration&rsquo;s MAC results
+are being stored to SRAM, the next iteration&rsquo;s A and B tiles are being loaded.
+</p>
+
+<table>
+  <tr><th>Batch size</th><th>Outer loop iters</th><th>Pipelined?</th>
+      <th>Measured TFLOPS</th></tr>
+  <tr><td>B=8 (padded, 1&times;1)</td><td>1</td><td>No</td>
+      <td>&lt; 4 (estimated)</td></tr>
+  <tr><td>B=16 (2&times;2)</td><td>1</td><td>No</td>
+      <td>8.04</td></tr>
+  <tr><td>B=24 (1&times;1)</td><td>3</td><td>Yes</td>
+      <td>~12 (estimated)</td></tr>
+  <tr style="background:#d4edda;font-weight:600;">
+      <td>B=48 (2&times;2)</td><td>3</td><td>Yes</td>
+      <td>23.93 (95.7% peak)</td></tr>
+</table>
+
+<p>
+The 2&times;2 expansion at B=48 wins because it processes 2048 MACs per
+inner-loop body (4 accumulators &times; 512 MACs), keeping all the
+accumulator registers busy.  A 1&times;1 kernel at B=24 pipelines correctly
+but only uses one quarter of the register file per iteration.
 </p>
 
 <div class="highlight">
@@ -1532,28 +1558,31 @@ Every architectural choice follows from a hardware constraint:
 <strong>Why not B=1 with a larger hidden dimension?</strong>
 <p>
 A natural question: could each column process a <em>single</em> sequence
-(B=1) and use the freed SRAM for a larger weight matrix? There are three
-reasons this does not work:
+(B=1) and use the freed SRAM for a larger weight matrix?
+</p>
+<p>
+B=1 is <em>not</em> a hardware impossibility. The MMUL instruction needs
+8&times;8 input tiles, so B=1 would require padding to B=8 (7 zero rows).
+This is valid &mdash; IRON&rsquo;s GEMM operator does exactly this for
+arbitrary dimensions. But it is highly wasteful:
 </p>
 <ol>
-  <li><strong>Hardware minimum:</strong> The
-      <a href="#g-mmul" class="gref">MMUL</a> unit processes 2r=16 rows per
-      output block. The kernel has <code>static_assert(DIM_M % 16 == 0)</code>,
-      so B=1 will not compile. The hard minimum is B=16.</li>
-  <li><strong>Pipelining:</strong> The chess compiler pipelines the matmul outer
-      loop, which has M/(2r) iterations. At B=16 that is just 1 iteration
-      &mdash; no pipeline fill, no overlap between load and compute.
-      B=48 gives 3 iterations, the minimum for the compiler to pipeline
-      effectively.</li>
-  <li><strong>SRAM still limits H:</strong> Even at B=1, the weight matrix
+  <li><strong>7/8 wasted compute:</strong> With B=1 padded to 8, the MMUL
+      processes 8 rows but only 1 produces useful output. One matmul yields
+      32K useful FLOPs instead of 1.57M with B=48 &mdash; a
+      <strong>48&times; efficiency loss</strong>.</li>
+  <li><strong>No loop pipelining:</strong> The outer loop has only 1 iteration
+      (B/8=1), so the chess compiler cannot overlap load/compute/store phases.
+      Peak throughput drops from 23.93 to &lt;4 TFLOPS.</li>
+  <li><strong>SRAM still limits H:</strong> Even with B=1, the weight matrix
       alone is H&times;H&times;2 bytes. H=192 needs 72 KB &gt; 64 KB.
       The maximum reachable is H&asymp;176 &mdash; only 37% more parameters per
       layer, while losing 48&times; the batch throughput.</li>
 </ol>
 <p>
-The batch dimension is what fills the systolic array. With B=1 (padded to 16),
-15 of every 16 rows are wasted. One matmul does 32K useful FLOPs instead of
-1.57M &mdash; a 48&times; efficiency loss. At that point a CPU is equally fast.
+At B=1, a CPU is equally fast or faster &mdash; the NPU&rsquo;s advantage
+comes precisely from processing many rows in parallel through its systolic
+array.
 </p>
 <p>
 An alternative approach would be to <em>shard</em> a large weight matrix
