@@ -9,6 +9,7 @@ Architecture:
 The 32 hidden layers match the 32 NPU tiles exactly.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -55,11 +56,10 @@ class ResMLP(nn.Module):
         return self.head(x)
 
     def export_npu_weights(self):
-        """Export the 32 hidden-layer weight matrices as numpy bf16 arrays.
+        """Export the 32 hidden-layer weight matrices as numpy bfloat16 arrays.
 
         Returns list of (H, H) numpy arrays in bfloat16, one per layer.
         """
-        import numpy as np
         from ml_dtypes import bfloat16
         weights = []
         for layer in self.layers:

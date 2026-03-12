@@ -1,7 +1,8 @@
 # NPU-Native Neural Networks
 
-Neural networks co-designed with the AMD XDNA 2 NPU — 32 layers on 32 tiles,
-programmed with [IRON](https://github.com/amd/IRON).
+Neural networks co-designed with the AMD XDNA 2 NPU — a 32-layer residual MLP,
+with one layer per tile across 32 NPU tiles, programmed with
+[IRON](https://github.com/amd/IRON).
 
 ## resmlp: 32-Layer Residual MLP on MNIST
 

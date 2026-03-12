@@ -48,6 +48,23 @@ def pack_weights(weights, H):
     return np.concatenate(parts)
 
 
+def zero_weights(H, rng):
+    """Identity test: W = 0 gives y = relu(x @ 0) + x = x."""
+    del rng
+    return np.zeros((H, H), dtype=np.float32)
+
+
+def scaled_identity_weights(H, rng):
+    """Small diagonal weights create a gentle, easy-to-check growth pattern."""
+    del rng
+    return np.eye(H, dtype=np.float32) * 0.1
+
+
+def random_small_weights(H, rng):
+    """Low-norm random weights for reference-vs-NPU comparison."""
+    return rng.standard_normal((H, H)).astype(np.float32) * 0.01
+
+
 # ── Tests ────────────────────────────────────────────────────────────────
 
 def run_test(H, B, num_cols, weights_fn, test_name, rtol=0.05, atol=0.01):
@@ -177,14 +194,14 @@ def main():
     # Test 1: Zero weights → identity (output = input)
     print("Test 1: Zero weights (identity)")
     ok = run_test(H, B, args.cols,
-                  weights_fn=lambda H, rng: np.zeros((H, H), dtype=np.float32),
+                  weights_fn=zero_weights,
                   test_name="zero weights → identity")
     all_pass &= ok
 
     # Test 2: Small scaled identity → slight growth
     print("\nTest 2: Tiny identity (W = 0.1 × I)")
     ok = run_test(H, B, args.cols,
-                  weights_fn=lambda H, rng: np.eye(H, dtype=np.float32) * 0.1,
+                  weights_fn=scaled_identity_weights,
                   test_name="0.1×I → gradual growth",
                   rtol=0.3, atol=1.0)
     all_pass &= ok
@@ -192,7 +209,7 @@ def main():
     # Test 3: Small random weights
     print("\nTest 3: Small random weights")
     ok = run_test(H, B, args.cols,
-                  weights_fn=lambda H, rng: rng.standard_normal((H, H)).astype(np.float32) * 0.01,
+                  weights_fn=random_small_weights,
                   test_name="random (σ=0.01)",
                   rtol=0.3, atol=0.5)
     all_pass &= ok

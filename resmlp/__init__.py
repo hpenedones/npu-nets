@@ -19,7 +19,7 @@ Architecture (8 columns × 4 rows = 32 tiles):
              ◄─────────────────────────
             (7,2)←(7,3)←(7,4)←(7,5) ──► DDR
 
-SRAM budget per tile (B=8, H=160):
+SRAM budget per tile (B=8, H=160, bfloat16):
     Weight matrix:  160×160×2 = 50.0 KB
     Input buffer:   8×160×2   =  2.5 KB
     Output buffer:  8×160×2   =  2.5 KB

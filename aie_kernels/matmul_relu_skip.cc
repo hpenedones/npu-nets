@@ -94,6 +94,7 @@ static inline void
 residual_add(const bfloat16 *__restrict a, bfloat16 *__restrict c)
 {
     constexpr int total = DIM_M * DIM_N;
+    // Process 32 elements per iteration to match the vector add used below.
     static_assert(total % 32 == 0, "Total elements must be divisible by 32");
 
     for (int i = 0; i < total; i += 32) {

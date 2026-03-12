@@ -87,7 +87,7 @@ runs the input embedding and the final classification head. The NPU runs the
 The result is a didactic but fully working example:
 \begin{itemize}
   \item the CPU model reaches about 97.1\% MNIST test accuracy,
-  \item the NPU implementation reaches 97.16\%,
+  \item the NPU implementation reaches 97.2\%,
   \item the NPU stage runs at about 24,114 images/s for batches of 8,
   \item a device-side benchmark reports about 55 GFLOPS for the 32-tile
         snake pipeline.
@@ -558,10 +558,11 @@ Weight buffer & all 32 tiled $H\times H$ matrices packed together & 1.56 MB \\
 \label{tab:buffer-sizes}
 \end{table}
 
-That last line explains a lot about the measured performance. The model feels
-``NPU-native'' because each layer lives on its own tile, but the current runtime
-still pays host-side setup and buffer-write costs every batch. This is not a bug;
-it is simply where the current implementation stops.
+This weight rewrite cost per batch explains the modest measured performance. The
+model is structurally ``NPU-native'': each layer maps directly to one physical
+tile. But the current runtime still pays host-side setup and buffer-write costs
+every batch. This is not a bug; it is simply where the current implementation
+stops.
 
 \section{Results and what they mean}
 

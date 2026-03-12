@@ -29,7 +29,8 @@ class ResMLP(AIEOperatorBase):
         self.num_tiles = num_cols * ROWS_PER_COL
         AIEOperatorBase.__init__(self, context=context)
 
-    def get_artifacts(self, prefix="resmlp_"):
+    def get_artifacts(self, prefix="resmlp_") -> tuple[XclbinArtifact, InstsBinArtifact]:
+        """Return the compiled xclbin and instruction-binary artifacts."""
         operator_dir = Path(__file__).parent
         project_dir = operator_dir.parent  # npu-spatial-nets root
         H, B = self.H, self.B

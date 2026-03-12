@@ -104,7 +104,7 @@ def main():
             pad = torch.zeros(B - actual_B, *images.shape[1:])
             images = torch.cat([images, pad])
 
-        # CPU: embed
+        # CPU embedding + layout transform: float activations -> bfloat16 -> tiled.
         t0 = time.perf_counter()
         x_flat = images.view(B, -1).float()
         x_hidden = (x_flat @ embed_weight.T + embed_bias).numpy()
