@@ -22,8 +22,8 @@ from resmlp import from_tiled, to_tiled
 from resmlp.backward_single_op import ResidualBackwardSingle
 
 
-def reference_backward(x, w, gy):
-    """Approximate the NPU backward pass with bf16 intermediate casts."""
+def reference_backward_sgd(x, w, gy, lr):
+    """Approximate the NPU backward pass and in-place SGD with bf16 intermediate casts."""
     x_f32 = x.astype(np.float32)
     w_f32 = w.astype(np.float32)
     gy_f32 = gy.astype(np.float32)
@@ -31,10 +31,13 @@ def reference_backward(x, w, gy):
     z = (x_f32 @ w_f32).astype(bfloat16).astype(np.float32)
     mask = (z > 0).astype(np.float32)
     gz = (gy_f32 * mask).astype(bfloat16).astype(np.float32)
+    
     dw = (x_f32.T @ gz).astype(bfloat16).astype(np.float32)
+    w_new = (w_f32 - lr * dw).astype(bfloat16).astype(np.float32)
+
     gx_mm = (gz @ w_f32.T).astype(bfloat16).astype(np.float32)
     gx = (gx_mm + gy_f32).astype(bfloat16).astype(np.float32)
-    return mask.astype(bfloat16), gx.astype(bfloat16), dw.astype(bfloat16)
+    return gx.astype(bfloat16), w_new.astype(bfloat16)
 
 
 def compare(name, ref, got, rtol, atol):
@@ -50,44 +53,45 @@ def compare(name, ref, got, rtol, atol):
     return pct > 95
 
 
-def run_test(H=160, B=8, scale=0.05):
+def run_test(H=160, B=8, scale=0.05, lr=0.01):
     rng = np.random.default_rng(7)
     x = rng.standard_normal((B, H)).astype(np.float32).astype(bfloat16)
     w = (rng.standard_normal((H, H)).astype(np.float32) * scale).astype(bfloat16)
     gy = rng.standard_normal((B, H)).astype(np.float32).astype(bfloat16)
 
-    mask, gx_ref, dw_ref = reference_backward(x, w, gy)
+    # Compute mask on CPU for tests
+    x_f32 = x.astype(np.float32)
+    w_f32 = w.astype(np.float32)
+    z = (x_f32 @ w_f32).astype(bfloat16).astype(np.float32)
+    mask = (z > 0).astype(bfloat16)
+
+    gx_ref, w_new_ref = reference_backward_sgd(x, w, gy, lr)
 
     ctx = AIEContext()
-    gx_op = ResidualBackwardSingle(H=H, B=B, mode="grad_input", context=ctx)
-    dw_op = ResidualBackwardSingle(H=H, B=B, mode="weight_grad", context=ctx)
+    fused_op = ResidualBackwardSingle(H=H, B=B, mode="fused", context=ctx)
     print(f"Compiling backward kernels (B={B}, H={H})...", flush=True)
     ctx.compile_all()
     ctx.prepare_runtime()
 
-    gx_op.write_buffer(
-        "state", np.concatenate([to_tiled(gy), to_tiled(mask)])
-    )
-    gx_op.write_buffer("weights_t", to_tiled(w.T))
-    gx_op.write_buffer("grad_in", np.zeros(B * H, dtype=bfloat16))
-    gx_op.run_runlist()
-    gx_npu = from_tiled(
-        gx_op.read_buffer("grad_in", (B * H,), copy=True), B, H
-    )
-
-    dw_op.write_buffer(
-        "state", np.concatenate([to_tiled(x), to_tiled(gy), to_tiled(mask)])
-    )
-    dw_op.write_buffer("dweights", np.zeros(H * H, dtype=bfloat16))
-    dw_op.run_runlist()
-    dw_npu = from_tiled(
-        dw_op.read_buffer("dweights", (H * H,), copy=True), H, H
-    )
+    x_ckpt = to_tiled(x)
+    mask_ckpt = to_tiled(mask)
+    gy_ckpt = to_tiled(gy)
+    fused_op.write_buffer("state", np.concatenate([x_ckpt, mask_ckpt, gy_ckpt]))
+    fused_op.write_buffer("wt_in", to_tiled(w))
+    
+    # We output to wt_out and gx
+    fused_op.write_buffer("wt_out", np.zeros(H * H, dtype=bfloat16))
+    fused_op.write_buffer("gx", np.zeros(B * H, dtype=bfloat16))
+    
+    fused_op.run_runlist()
+    
+    w_new_npu = from_tiled(fused_op.read_buffer("wt_out", (H * H,), copy=True), H, H)
+    gx_npu = from_tiled(fused_op.read_buffer("gx", (B * H,), copy=True), B, H)
 
     print("\nBackward checks:")
-    ok_gx = compare("grad input", gx_ref, gx_npu, rtol=0.20, atol=0.20)
-    ok_dw = compare("weight grad", dw_ref, dw_npu, rtol=0.20, atol=0.20)
-    return ok_gx and ok_dw
+    ok_gx = compare("fused gx", gx_ref, gx_npu, rtol=0.20, atol=0.20)
+    ok_w = compare("fused w_new", w_new_ref, w_new_npu, rtol=0.20, atol=0.20)
+    return ok_gx and ok_w
 
 
 def main():

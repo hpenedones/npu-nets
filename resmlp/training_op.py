@@ -1,7 +1,3 @@
-"""
-Operator wrapper for the 4-tile forward checkpoint probe.
-"""
-
 from pathlib import Path
 
 from iron.common import (
@@ -14,27 +10,27 @@ from iron.common import (
     XclbinArtifact,
 )
 
-from resmlp.forward_checkpoint_design import ROWS_PER_COL
+from resmlp.training_design import ROWS_PER_COL
 
+class TrainingPipeline(AIEOperatorBase):
+    """32-tile pipeline that executes both forward and backward pass with on-chip SGD."""
 
-class ForwardCheckpointColumn(AIEOperatorBase):
-    """4-tile column probe that emits per-tile input checkpoints."""
-
-    def __init__(self, H=160, B=8, context=None):
+    def __init__(self, H=160, B=8, num_cols=8, context=None):
         self.H = H
         self.B = B
+        self.num_cols = num_cols
         super().__init__(context=context)
 
-    def get_artifacts(self, prefix="resmlp_forward_checkpoint_"):
+    def get_artifacts(self, prefix="resmlp_training_"):
         operator_dir = Path(__file__).parent
         project_dir = operator_dir.parent
-        H, B = self.H, self.B
+        H, B, cols = self.H, self.B, self.num_cols
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{prefix}{B}x{H}.mlir",
-            import_path=operator_dir / "forward_checkpoint_design.py",
-            callback_fn="forward_checkpoint_column",
-            callback_kwargs={"H": H, "B": B},
+            f"{prefix}{cols}cols_{B}x{H}.mlir",
+            import_path=operator_dir / "training_design.py",
+            callback_fn="training_pipeline",
+            callback_kwargs={"H": H, "B": B, "num_cols": cols},
             requires_context=False,
         )
 
@@ -46,18 +42,27 @@ class ForwardCheckpointColumn(AIEOperatorBase):
         ]
 
         xclbin_artifact = XclbinArtifact.new(
-            f"{prefix}{B}x{H}.xclbin",
+            f"{prefix}{cols}cols_{B}x{H}.xclbin",
             depends=[
                 mlir_artifact,
                 KernelArchiveArtifact.new(
-                    "resmlp_forward_checkpoint_kernels.a",
+                    "resmlp_training_kernels.a",
                     depends=[
                         KernelObjectArtifact.new(
-                            "forward_ckpt_kernel.o",
+                            "matmul_relu_skip.o",
                             extra_flags=kernel_flags,
                             depends=[
                                 SourceArtifact.new(
                                     project_dir / "aie_kernels" / "matmul_relu_skip.cc"
+                                )
+                            ],
+                        ),
+                        KernelObjectArtifact.new(
+                            "residual_backward.o",
+                            extra_flags=kernel_flags,
+                            depends=[
+                                SourceArtifact.new(
+                                    project_dir / "aie_kernels" / "residual_backward.cc"
                                 )
                             ],
                         ),
@@ -76,7 +81,7 @@ class ForwardCheckpointColumn(AIEOperatorBase):
         )
 
         insts_artifact = InstsBinArtifact.new(
-            f"{prefix}{B}x{H}.bin",
+            f"{prefix}{cols}cols_{B}x{H}.bin",
             depends=[mlir_artifact],
         )
 
@@ -89,21 +94,25 @@ class ForwardCheckpointColumn(AIEOperatorBase):
         self.add_artifacts([xclbin, insts])
 
     def set_up_runtime(self):
-        H, B = self.H, self.B
+        H, B, cols = self.H, self.B, self.num_cols
+        num_tiles = cols * ROWS_PER_COL
+        
         self.add_kernel(
-            "forward_checkpoint",
+            "training_pipeline",
             self.xclbin_artifact,
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_buffer("input", B * H)
-        self.add_buffer("weights", ROWS_PER_COL * H * H)
-        self.add_buffer("checkpoints", ROWS_PER_COL * B * H)
-        self.add_buffer("output", B * H)
+        self.add_buffer("act_in", B * H)
+        self.add_buffer("weights_in", num_tiles * H * H)
+        self.add_buffer("act_out", B * H)
+        self.add_buffer("grad_in", B * H)
+        self.add_buffer("grad_out", B * H)
         self.add_to_runlist(
-            "forward_checkpoint",
-            "input",
-            "weights",
-            "checkpoints",
-            "output",
+            "training_pipeline",
+            "act_in",
+            "weights_in",
+            "act_out",
+            "grad_in",
+            "grad_out",
         )

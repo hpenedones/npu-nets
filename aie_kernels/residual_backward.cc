@@ -17,7 +17,9 @@
 
 #define NOCPP
 
+#ifndef HOST_TEST
 #include <aie_api/aie.hpp>
+#endif
 
 #ifndef DIM_M
 #define DIM_M 8
@@ -37,7 +39,7 @@ matmul_plain(const T *__restrict pA,
 {
     constexpr unsigned r = 8, s = 8, t = 8;
     using MMUL = aie::mmul<r, s, t, T, T, accauto>;
-    const auto zeros = aie::zeros<T, MMUL::size_C>();
+    const auto zeros = aie::zeros<accfloat, MMUL::size_C>();
 
     for (unsigned z = 0; z < rowA; ++z) {
         T *__restrict pC1 = pC + z * colB * MMUL::size_C;
@@ -84,7 +86,7 @@ matmul_transpose_a(const T *__restrict pA,
 {
     constexpr unsigned r = 8, s = 8, t = 8;
     using MMUL = aie::mmul<r, s, t, T, T, accauto>;
-    const auto zeros = aie::zeros<T, MMUL::size_C>();
+    const auto zeros = aie::zeros<accfloat, MMUL::size_C>();
     alignas(32) T a_tile_t[MMUL::size_A];
 
     for (unsigned z = 0; z < rowA; ++z) {
@@ -106,6 +108,45 @@ matmul_transpose_a(const T *__restrict pA,
                 transpose_tile_8x8(pA_block, a_tile_t);
                 auto A0 = aie::load_v<MMUL::size_A>(a_tile_t);
                 auto B0 = aie::load_v<MMUL::size_B>(pB_block);
+                C00.mac(A0, B0);
+            }
+
+            aie::store_v(pC1, C00.template to_vector<T>());
+            pC1 += MMUL::size_C;
+        }
+    }
+}
+
+template <typename T, unsigned rowA, unsigned colA, unsigned colB>
+static inline void
+matmul_transpose_b(const T *__restrict pA,
+                   const T *__restrict pB,
+                   T *__restrict pC)
+{
+    constexpr unsigned r = 8, s = 8, t = 8;
+    using MMUL = aie::mmul<r, s, t, T, T, accauto>;
+    const auto zeros = aie::zeros<accfloat, MMUL::size_C>();
+    alignas(32) T b_tile_t[MMUL::size_B];
+
+    for (unsigned z = 0; z < rowA; ++z) {
+        T *__restrict pC1 = pC + z * colB * MMUL::size_C;
+
+        for (unsigned j = 0; j < colB; ++j)
+            chess_prepare_for_pipelining chess_loop_range(3, )
+        {
+            MMUL C00(zeros);
+
+            for (unsigned i = 0; i < colA; ++i)
+                chess_flatten_loop
+            {
+                const T *__restrict pA_block =
+                    pA + (z * colA + i) * MMUL::size_A;
+                const T *__restrict pB_block =
+                    pB + (j * colA + i) * MMUL::size_B;
+
+                transpose_tile_8x8(pB_block, b_tile_t);
+                auto A0 = aie::load_v<MMUL::size_A>(pA_block);
+                auto B0 = aie::load_v<MMUL::size_B>(b_tile_t);
                 C00.mac(A0, B0);
             }
 
@@ -159,8 +200,6 @@ void residual_grad_input_bf16(bfloat16 *state,
 
     alignas(32) bfloat16 gz[DIM_M * DIM_N];
 
-    ::aie::set_rounding(aie::rounding_mode::floor);
-
     // Step 1: gz = gy * relu_mask
     elementwise_mul(gy, mask, gz);
 
@@ -173,7 +212,7 @@ void residual_grad_input_bf16(bfloat16 *state,
     residual_add(gy, gx);
 }
 
-void residual_weight_grad_bf16(bfloat16 *state, bfloat16 *dw)
+void residual_sgd_update_bf16(bfloat16 *state, bfloat16 *w, float lr)
 {
     static_assert(DIM_M % 8 == 0, "Batch must be multiple of 8");
     static_assert(DIM_K % 8 == 0, "Input dim must be multiple of 8");
@@ -183,17 +222,131 @@ void residual_weight_grad_bf16(bfloat16 *state, bfloat16 *dw)
     bfloat16 *gy = state + DIM_M * DIM_K;
     bfloat16 *mask = gy + DIM_M * DIM_N;
 
-    alignas(32) bfloat16 gz[DIM_M * DIM_N];
+    // Use the mask buffer itself to store gz to save 2.5 KB of tile SRAM!
+    bfloat16 *gz = mask;
 
-    ::aie::set_rounding(aie::rounding_mode::floor);
-
-    // Step 1: gz = gy * relu_mask
+    // Step 1: gz = gy * relu_mask (in-place over mask)
     elementwise_mul(gy, mask, gz);
 
-    // Step 2: dw = x^T @ gz
-    matmul_transpose_a<bfloat16, (DIM_K / 8), (DIM_M / 8), (DIM_N / 8)>(
-        x, gz, dw
+    // Step 2: W = W - lr * (x^T @ gz)
+    // We compute the outer product and accumulate directly into the weights!
+
+    constexpr unsigned r = 8, s = 8, t = 8;
+    using MMUL = aie::mmul<r, s, t, bfloat16, bfloat16, accauto>;
+    const auto zeros = aie::zeros<accfloat, MMUL::size_C>();
+    alignas(32) bfloat16 a_tile_t[MMUL::size_A];
+
+    // Note: This assumes `w` is in the standard untransposed tiled layout.
+    // In our model (H=160), W is 160x160.
+    for (unsigned j = 0; j < (DIM_N / 8); ++j) {
+        for (unsigned z = 0; z < (DIM_K / 8); ++z) {
+            bfloat16 *w_block = w + (z * (DIM_N / 8) + j) * MMUL::size_C;
+            
+            // Load the current weight block
+            // Compute dW for this block in an empty accumulator
+            MMUL C00(zeros);
+
+            for (unsigned i = 0; i < (DIM_M / 8); ++i)
+                chess_flatten_loop
+            {
+                const bfloat16 *pA_block = x + (i * (DIM_K / 8) + z) * MMUL::size_A;
+                const bfloat16 *pB_block = gz + (i * (DIM_N / 8) + j) * MMUL::size_B;
+
+                // Transpose the activation block x -> x^T
+                transpose_tile_8x8<bfloat16>(pA_block, a_tile_t);
+                
+                auto A0 = aie::load_v<MMUL::size_A>(a_tile_t);
+                auto B0 = aie::load_v<MMUL::size_B>(pB_block);
+                
+                // dW += x^T @ gz
+                C00.mac(A0, B0);
+            }
+
+            // We have the gradient block dW = C00.
+            // We want W = W - lr * dW.
+            // Load current W block
+            auto w_vec = aie::load_v<MMUL::size_C>(w_block);
+            
+            // Broadcast learning rate into a 64-element vector to match dW
+            auto lr_vec = aie::broadcast<bfloat16, 64>(lr);
+            
+            // Scaled subtraction: w_vec - lr * dW
+            // AIE MAC output is 32-bit float accumulated. We convert dW to float/bfloat vector.
+            auto dw_vec = C00.template to_vector<bfloat16>();
+            
+            // (lr * dW)
+            auto step_vec = aie::mul(lr_vec, dw_vec).template to_vector<bfloat16>();
+            
+            // W - (lr * dW)
+            auto w_new = aie::sub(w_vec, step_vec);
+            
+            // Store it back
+            aie::store_v(w_block, w_new);
+        }
+    }
+}
+
+void residual_backward_and_update_bf16(bfloat16 *ckpt, bfloat16 *w, bfloat16 *gy, bfloat16 *gx)
+{
+    float lr = 0.01f;
+    static_assert(DIM_M % 8 == 0, "Batch must be multiple of 8");
+    static_assert(DIM_K % 8 == 0, "Input dim must be multiple of 8");
+    static_assert(DIM_N % 8 == 0, "Output dim must be multiple of 8");
+
+    bfloat16 *x = ckpt;
+    bfloat16 *mask = ckpt + DIM_M * DIM_K;
+
+    // Reuse mask buffer to store gz and save 2.5KB of SRAM/stack!
+    bfloat16 *gz = mask;
+
+    // Step 1: gz = gy * mask
+    elementwise_mul(gy, mask, gz);
+
+    // Step 2: gx = gz @ W^T
+    matmul_transpose_b<bfloat16, (DIM_M / 8), (DIM_N / 8), (DIM_K / 8)>(
+        gz, w, gx
     );
+
+    // Step 3: gx += gy   (skip-connection gradient)
+    residual_add(gy, gx);
+
+    // Step 4: W = W - lr * (x^T @ gz)
+    // We compute the outer product and accumulate directly into the weights!
+
+    constexpr unsigned r = 8, s = 8, t = 8;
+    using MMUL = aie::mmul<r, s, t, bfloat16, bfloat16, accauto>;
+    const auto zeros = aie::zeros<accfloat, MMUL::size_C>();
+    alignas(32) bfloat16 a_tile_t[MMUL::size_A];
+
+    for (unsigned j = 0; j < (DIM_N / 8); ++j) {
+        for (unsigned z = 0; z < (DIM_K / 8); ++z) {
+            bfloat16 *w_block = w + (z * (DIM_N / 8) + j) * MMUL::size_C;
+            
+            MMUL C00(zeros);
+
+            for (unsigned i = 0; i < (DIM_M / 8); ++i)
+                chess_flatten_loop
+            {
+                const bfloat16 *pA_block = x + (i * (DIM_K / 8) + z) * MMUL::size_A;
+                const bfloat16 *pB_block = gz + (i * (DIM_N / 8) + j) * MMUL::size_B;
+
+                transpose_tile_8x8<bfloat16>(pA_block, a_tile_t);
+                
+                auto A0 = aie::load_v<MMUL::size_A>(a_tile_t);
+                auto B0 = aie::load_v<MMUL::size_B>(pB_block);
+                
+                C00.mac(A0, B0);
+            }
+
+            auto w_vec = aie::load_v<MMUL::size_C>(w_block);
+            auto lr_vec = aie::broadcast<bfloat16, 64>(lr);
+            auto dw_vec = C00.template to_vector<bfloat16>();
+            auto step_vec = aie::mul(lr_vec, dw_vec).template to_vector<bfloat16>();
+            auto w_new = aie::sub(w_vec, step_vec);
+            
+            aie::store_v(w_block, w_new);
+        }
+    }
 }
 
 } // extern "C"

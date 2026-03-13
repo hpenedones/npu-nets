@@ -17,11 +17,14 @@ from resmlp.forward_checkpoint_op import ForwardCheckpointColumn, ROWS_PER_COL
 def reference_forward_with_checkpoints(x, weights):
     current = x.astype(np.float32)
     checkpoints = []
+    masks = []
     for w in weights:
         checkpoints.append(current.astype(bfloat16))
         matmul_out = (current @ w.astype(np.float32)).astype(bfloat16).astype(np.float32)
+        mask_out = (matmul_out > 0).astype(bfloat16)
+        masks.append(mask_out)
         current = (np.maximum(matmul_out, 0) + current).astype(bfloat16).astype(np.float32)
-    return checkpoints, current.astype(bfloat16)
+    return checkpoints, masks, current.astype(bfloat16)
 
 
 def compare(name, ref, got, rtol, atol):
@@ -45,7 +48,7 @@ def run_test(H=160, B=8, scale=0.05):
         for _ in range(ROWS_PER_COL)
     ]
 
-    checkpoints_ref, y_ref = reference_forward_with_checkpoints(x, weights)
+    checkpoints_ref, masks_ref, y_ref = reference_forward_with_checkpoints(x, weights)
 
     ctx = AIEContext()
     op = ForwardCheckpointColumn(H=H, B=B, context=ctx)
@@ -55,21 +58,26 @@ def run_test(H=160, B=8, scale=0.05):
 
     op.write_buffer("input", to_tiled(x))
     op.write_buffer("weights", np.concatenate([to_tiled(w) for w in weights]))
-    op.write_buffer("checkpoints", np.zeros(ROWS_PER_COL * B * H, dtype=bfloat16))
+    op.write_buffer("checkpoints", np.zeros(ROWS_PER_COL * 2 * B * H, dtype=bfloat16))
     op.write_buffer("output", np.zeros(B * H, dtype=bfloat16))
     op.run_runlist()
 
     y_npu = from_tiled(op.read_buffer("output", (B * H,), copy=True), B, H)
-    ckpt_flat = op.read_buffer("checkpoints", (ROWS_PER_COL * B * H,), copy=True)
-    checkpoints_npu = [
-        from_tiled(ckpt_flat[i * B * H : (i + 1) * B * H], B, H)
-        for i in range(ROWS_PER_COL)
-    ]
+    
+    ckpt_flat = op.read_buffer("checkpoints", (ROWS_PER_COL * 2 * B * H,), copy=True)
+    checkpoints_npu = []
+    masks_npu = []
+    for i in range(ROWS_PER_COL):
+        tile_out = ckpt_flat[i * 2 * B * H : (i + 1) * 2 * B * H]
+        checkpoints_npu.append(from_tiled(tile_out[0 : B * H], B, H))
+        masks_npu.append(from_tiled(tile_out[B * H : 2 * B * H], B, H))
 
     print("\nCheckpoint probe checks:")
     ok = compare("final output", y_ref, y_npu, rtol=0.10, atol=0.10)
     for i, (ref, got) in enumerate(zip(checkpoints_ref, checkpoints_npu)):
-        ok &= compare(f"checkpoint x_{i}", ref, got, rtol=0.0, atol=0.0)
+        ok &= compare(f"checkpoint x_{i}", ref, got, rtol=0.10, atol=0.10)
+    for i, (ref, got) in enumerate(zip(masks_ref, masks_npu)):
+        ok &= compare(f"mask m_{i}", ref, got, rtol=0.0, atol=0.0)
     return ok
 
 

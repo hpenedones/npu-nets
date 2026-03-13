@@ -47,16 +47,19 @@ template <typename T, unsigned rowA, unsigned colA, unsigned colB>
 static inline void
 matmul_relu(const T *__restrict pA,
             const T *__restrict pB,
-            T *__restrict pC)
+            T *__restrict pC,
+            T *__restrict pMask)
 {
     constexpr unsigned r = 8, s = 8, t = 8;
     using MMUL = aie::mmul<r, s, t, T, T, accauto>;
     const auto zeros = aie::zeros<T, MMUL::size_C>();
+    const auto ones = aie::broadcast<T, MMUL::size_C>(1.0f);
 
     event0();
 
     for (unsigned z = 0; z < rowA; z += 1) {
         T *__restrict pC1 = pC + z * colB * MMUL::size_C;
+        T *__restrict pM1 = pMask + z * colB * MMUL::size_C;
 
         for (unsigned j = 0; j < colB; j += 1)
             chess_prepare_for_pipelining chess_loop_range(3, )
@@ -76,9 +79,17 @@ matmul_relu(const T *__restrict pA,
                 C00.mac(A0, B0);
             }
 
-            aie::store_v(pC1,
-                aie::max(C00.template to_vector<T>(), zeros));
+            auto vec_c = C00.template to_vector<T>();
+            auto relu_c = aie::max(vec_c, zeros);
+            
+            // Mask is 1.0 if vec_c > 0, else 0.0
+            auto gt_mask = aie::gt(vec_c, zeros);
+            auto mask_v = aie::select(zeros, ones, gt_mask);
+
+            aie::store_v(pC1, relu_c);
+            aie::store_v(pM1, mask_v);
             pC1 += MMUL::size_C;
+            pM1 += MMUL::size_C;
         }
     }
 
@@ -108,16 +119,16 @@ residual_add(const bfloat16 *__restrict a, bfloat16 *__restrict c)
 
 extern "C" {
 
-void matmul_relu_skip_bf16(bfloat16 *a, bfloat16 *w, bfloat16 *c)
+void matmul_relu_skip_bf16(bfloat16 *a, bfloat16 *w, bfloat16 *c, bfloat16 *mask_out, int mask_offset)
 {
     static_assert(DIM_M % 8 == 0, "Batch must be multiple of 8");
     static_assert(DIM_K % 8 == 0, "Input dim must be multiple of 8");
     static_assert(DIM_N % 8 == 0, "Output dim must be multiple of 8");
 
-    ::aie::set_rounding(aie::rounding_mode::floor);
+    bfloat16 *mask = mask_out + mask_offset;
 
     // Step 1: c = relu(a @ w)
-    matmul_relu<bfloat16, (DIM_M / 8), (DIM_K / 8), (DIM_N / 8)>(a, w, c);
+    matmul_relu<bfloat16, (DIM_M / 8), (DIM_K / 8), (DIM_N / 8)>(a, w, c, mask);
 
     // Step 2: c += a  (residual skip connection)
     residual_add(a, c);

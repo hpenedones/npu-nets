@@ -31,30 +31,42 @@ Input (784) → Linear → H=160
 # Train on CPU (~45 seconds)
 python -m resmlp.train
 
-# Test NPU pipeline correctness
-python -m resmlp.test
+# Train on NPU (forward+backward+SGD on 32 tiles)
+python -m resmlp.train_npu --epochs 10
 
 # Run MNIST inference on NPU
 python -m resmlp.infer resmlp/checkpoints/resmlp_epoch009.pt --bench
+
+# Test NPU pipeline correctness
+python -m tests.test_training --cols 1
+python -m tests.test_inference --cols 1
 ```
 
 ## Project Structure
 
 ```
 resmlp/
-├── model.py       # PyTorch model: embed → 32 × ResidualLinear → head
-├── train.py       # MNIST training
-├── infer.py       # NPU inference with trained weights
-├── design.py      # IRON snake pipeline (32 tiles, 8 cols × 4 rows)
-├── op.py          # IRON operator wrapper
-└── test.py        # Correctness tests + benchmark
+├── __init__.py          # Tiled layout utilities (to_tiled / from_tiled)
+├── model.py             # PyTorch model: embed → 32 × ResidualLinear → head
+├── train.py             # CPU-only MNIST training
+├── train_npu.py         # NPU-accelerated MNIST training
+├── infer.py             # NPU inference with trained weights
+├── design.py            # IRON snake pipeline (inference: 32 tiles)
+├── op.py                # IRON operator wrapper (inference)
+├── training_design.py   # IRON training pipeline (fwd + bwd + SGD)
+└── training_op.py       # IRON operator wrapper (training)
 
 aie_kernels/
-└── matmul_relu_skip.cc   # Fused kernel: c = relu(a @ w) + a
-```
+├── matmul_relu_skip.cc  # Fused fwd kernel: c = relu(a @ w) + a
+├── residual_backward.cc # Fused bwd kernel: grad + in-place SGD update
+└── copy_activation.cc   # SRAM block copy utility
 
-See [logbook.md](logbook.md) for earlier experiments (peak throughput
-benchmarking, character language model, hardware constraints discovered).
+tests/
+├── test_inference.py    # Snake pipeline correctness + benchmark
+├── test_backward.py     # Single-layer backward validation
+├── test_checkpoint.py   # Forward checkpoint probe
+└── test_training.py     # Full training pipeline validation (fwd+bwd+SGD)
+```
 
 ## Requirements
 
