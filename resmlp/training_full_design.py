@@ -53,10 +53,12 @@ def full_training_pipeline(H=32, B=8, K_EMBED=784, num_cols=8):
     d_logits_ty = np.ndarray[(B * N_CLS_PADDED,), np.dtype[bfloat16]]
 
     # ── Kernels ────────────────────────────────────────────────────
+    embed_wt_ty_chunk = np.ndarray[((K_EMBED // 4) * H,), np.dtype[bfloat16]]
+    
     embed_fwd_k  = Kernel("embed_forward_bf16",  "full_training_kernels.a",
-                          [embed_in_ty, embed_wt_ty, act_ty])
+                          [embed_in_ty, embed_wt_ty_chunk, embed_wt_ty_chunk, embed_wt_ty_chunk, embed_wt_ty_chunk, act_ty])
     embed_bwd_k  = Kernel("embed_backward_bf16", "full_training_kernels.a",
-                          [embed_in_ty, embed_wt_ty, act_ty])
+                          [embed_in_ty, embed_wt_ty_chunk, embed_wt_ty_chunk, embed_wt_ty_chunk, embed_wt_ty_chunk, act_ty])
     res_fwd_k    = Kernel("matmul_relu_skip_bf16", "full_training_kernels.a",
                           [act_ty, res_wt_ty, act_ty, ckpt_ty, np.int32])
     res_copy_k   = Kernel("copy_activation_bf16", "full_training_kernels.a",
@@ -71,7 +73,8 @@ def full_training_pipeline(H=32, B=8, K_EMBED=784, num_cols=8):
                             [head_wt_ty, head_wt_ty])
 
     # ── Weight ObjectFifos ─────────────────────────────────────────
-    embed_wt_fifo = ObjectFifo(embed_wt_ty, name="embed_wt", depth=1)
+    embed_wt_fifo = ObjectFifo(embed_wt_ty_chunk, name="embed_wt", depth=4)
+    
     head_wt_fifo  = ObjectFifo(head_wt_ty,  name="head_wt",  depth=1)
     head_wt_out = ObjectFifo(head_wt_ty, name="head_wt_out", depth=1)
 
@@ -123,20 +126,23 @@ def full_training_pipeline(H=32, B=8, K_EMBED=784, num_cols=8):
               fwd_k, bwd_k):
             x = of_x_in.acquire(1)
             y = of_y_out.acquire(1)
-            wt = of_wt.acquire(1)
-            fwd_k(x, wt, y)
+            
+            # depth=4 means we acquire 4 elements sequentially memory mapped
+            ws = of_wt.acquire(4)
+            fwd_k(x, ws[0], ws[1], ws[2], ws[3], y)
             of_x_in.release(1)
             of_y_out.release(1)
 
             dy = of_grad_in.acquire(1)
             x2 = of_x_in.acquire(1)
-            bwd_k(x2, wt, dy)
+            
+            bwd_k(x2, ws[0], ws[1], ws[2], ws[3], dy)
             done = of_done.acquire(1)
             done[0] = 1
             of_grad_in.release(1)
             of_x_in.release(1)
             of_done.release(1)
-            of_wt.release(1)
+            of_wt.release(4)
         return w
 
     workers.append(Worker(
@@ -262,7 +268,14 @@ def full_training_pipeline(H=32, B=8, K_EMBED=784, num_cols=8):
         rt.start(*workers)
 
         tg_fwd = rt.task_group()
-        rt.fill(embed_wt_fifo.prod(), wt_embed, task_group=tg_fwd)
+        wt_embed_tap0 = TensorAccessPattern((1, K_EMBED * H), 0, [1, (K_EMBED // 4), H], [0, H, 1])
+        wt_embed_tap1 = TensorAccessPattern((1, K_EMBED * H), (K_EMBED // 4) * H, [1, (K_EMBED // 4), H], [0, H, 1])
+        wt_embed_tap2 = TensorAccessPattern((1, K_EMBED * H), 2 * (K_EMBED // 4) * H, [1, (K_EMBED // 4), H], [0, H, 1])
+        wt_embed_tap3 = TensorAccessPattern((1, K_EMBED * H), 3 * (K_EMBED // 4) * H, [1, (K_EMBED // 4), H], [0, H, 1])
+        rt.fill(embed_wt_fifo.prod(), wt_embed, tap=wt_embed_tap0, task_group=tg_fwd)
+        rt.fill(embed_wt_fifo.prod(), wt_embed, tap=wt_embed_tap1, task_group=tg_fwd)
+        rt.fill(embed_wt_fifo.prod(), wt_embed, tap=wt_embed_tap2, task_group=tg_fwd)
+        rt.fill(embed_wt_fifo.prod(), wt_embed, tap=wt_embed_tap3, task_group=tg_fwd)
         rt.fill(head_wt_fifo.prod(),  wt_head,  task_group=tg_fwd)
 
         res_wt_offset = 0

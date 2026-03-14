@@ -46,7 +46,7 @@ transpose_tile_8x8(const T *__restrict src, T *__restrict dst)
 
 extern "C" {
 
-void embed_backward_bf16(bfloat16 *x, bfloat16 *w, bfloat16 *dy)
+void embed_backward_bf16(bfloat16 *x, bfloat16 *w0, bfloat16 *w1, bfloat16 *dy)
 {
     float lr = 0.01f;
 
@@ -71,7 +71,12 @@ void embed_backward_bf16(bfloat16 *x, bfloat16 *w, bfloat16 *dy)
 
     for (unsigned z = 0; z < rowsK; ++z) {
         for (unsigned j = 0; j < colsH; ++j) {
-            bfloat16 *w_block = w + (z * colsH + j) * MMUL::size_C;
+            bfloat16 *w_block;
+            if (z < rowsK / 2) {
+                w_block = w0 + (z * colsH + j) * MMUL::size_C;
+            } else {
+                w_block = w1 + ((z - rowsK / 2) * colsH + j) * MMUL::size_C;
+            }
 
             MMUL C00(zeros);
 
@@ -79,7 +84,6 @@ void embed_backward_bf16(bfloat16 *x, bfloat16 *w, bfloat16 *dy)
                 chess_flatten_loop
             {
                 // x is [M/8, K/8, 8, 8] — to get x^T block [z,i]:
-                // we need the [i, z] block of x, then transpose it
                 const bfloat16 *pA_block = x + (i * rowsK + z) * MMUL::size_A;
                 const bfloat16 *pB_block = dy + (i * colsH + j) * MMUL::size_B;
 

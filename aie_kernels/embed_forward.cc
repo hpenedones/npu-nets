@@ -34,9 +34,10 @@
 
 template <typename T, unsigned rowA, unsigned colA, unsigned colB>
 static inline void
-matmul_plain(const T *__restrict pA,
-             const T *__restrict pB,
-             T *__restrict pC)
+matmul_plain_two_chunks(const T *__restrict pA,
+                        const T *__restrict pB0,
+                        const T *__restrict pB1,
+                        T *__restrict pC)
 {
     constexpr unsigned r = 8, s = 8, t = 8;
     using MMUL = aie::mmul<r, s, t, T, T, accauto>;
@@ -49,7 +50,8 @@ matmul_plain(const T *__restrict pA,
             chess_prepare_for_pipelining chess_loop_range(3, )
         {
             const T *__restrict pA1 = pA + z * colA * MMUL::size_A;
-            const T *__restrict pB1 = pB + j * MMUL::size_B;
+            const T *__restrict pB0_1 = pB0 + j * MMUL::size_B;
+            const T *__restrict pB1_1 = pB1 + j * MMUL::size_B;
             MMUL C00(zeros);
 
             for (unsigned i = 0; i < colA; ++i)
@@ -57,8 +59,14 @@ matmul_plain(const T *__restrict pA,
             {
                 auto A0 = aie::load_v<MMUL::size_A>(pA1);
                 pA1 += MMUL::size_A;
-                auto B0 = aie::load_v<MMUL::size_B>(pB1);
-                pB1 += MMUL::size_B * colB;
+                
+                auto B0 = (i < colA / 2) ? aie::load_v<MMUL::size_B>(pB0_1) : aie::load_v<MMUL::size_B>(pB1_1);
+                if (i < colA / 2) {
+                    pB0_1 += MMUL::size_B * colB;
+                } else {
+                    pB1_1 += MMUL::size_B * colB;
+                }
+                
                 C00.mac(A0, B0);
             }
 
@@ -72,14 +80,15 @@ matmul_plain(const T *__restrict pA,
 
 extern "C" {
 
-void embed_forward_bf16(bfloat16 *x, bfloat16 *w, bfloat16 *y)
+void embed_forward_bf16(bfloat16 *x, bfloat16 *w0, bfloat16 *w1, bfloat16 *y)
 {
     static_assert(DIM_M % 8 == 0, "Batch must be multiple of 8");
     static_assert(DIM_K_EMBED % 8 == 0, "Input dim must be multiple of 8");
+    static_assert(DIM_K_EMBED % 16 == 0, "Input dim must be multiple of 16 to split in 2");
     static_assert(DIM_H % 8 == 0, "Hidden dim must be multiple of 8");
 
     // y[M×H] = x[M×K] @ w[K×H]
-    matmul_plain<bfloat16, (DIM_M / 8), (DIM_K_EMBED / 8), (DIM_H / 8)>(x, w, y);
+    matmul_plain_two_chunks<bfloat16, (DIM_M / 8), (DIM_K_EMBED / 8), (DIM_H / 8)>(x, w0, w1, y);
 }
 
 } // extern "C"
