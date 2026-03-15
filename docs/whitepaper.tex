@@ -867,25 +867,73 @@ Epoch & Train acc & Test acc & Time (s) & Img/s & ms/call \\
 9 & 0.1029 & 0.1016 & 41.5 & 1446 & 4.7 \\
 \bottomrule
 \end{tabular}
-\caption{Ten-epoch MNIST run for the current \code{simplecnn} default:
-batch size 8, one compute column, four trainable tiles, top-1 hinge head, and
-NPU SGD step $\eta=0.05$. Each epoch still launches 7,500 NPU calls because
-the current host path is batch-oriented rather than epoch-resident.}
+\caption{Ten-epoch MNIST run for the original batch-oriented \code{simplecnn}
+baseline: batch size 8, one compute column, four trainable tiles, top-1 hinge
+head, NPU SGD step $\eta=0.05$, and one NPU call per batch.}
 \label{tab:simplecnn-10epoch}
 \end{table}
 
-The result is mixed but useful. The design is now stable across 10 epochs with
-no numeric failure or runtime corruption, and the measured NPU call itself is
-small: about 4.7--5.3 ms. Throughput is also respectable for such a tiny
-pedagogical design, roughly 1.3--1.4k images/s. But the learning signal remains
-weak: the best test accuracy in this run is 10.77\% at epoch 0, and the final
-test accuracy is 10.16\% at epoch 9, which is effectively chance on MNIST.
+That original baseline is mixed but useful. The design is stable across 10
+epochs with no numeric failure or runtime corruption, and the measured NPU call
+itself is small: about 4.7--5.3 ms. Throughput is also respectable for such a
+tiny pedagogical design, roughly 1.3--1.4k images/s. But the learning signal
+remains weak: the best test accuracy in this run is 10.77\% at epoch 0, and
+the final test accuracy is 10.16\% at epoch 9, which is effectively chance on
+MNIST.
+
+\subsection{Resident-window follow-up}
+
+After the 10-epoch bring-up, the next question was whether the one-column path
+could follow the same broad strategy used in AMD's official one-column streaming
+examples. The closer analogue is the edge-detect example: one task pipeline over
+a single compute column, using neighboring-tile memories and ping-pong-style
+buffering to reduce dead time between kernels. The scaled color-threshold
+example is a useful secondary reference, but it is primarily a MemTile
+split/concat design for data-parallel fanout and fanin, not a layer-parallel
+training pipeline.
+
+The practical adaptation for \code{simplecnn} was therefore at the
+host/runtime boundary first. The current CLI now groups minibatches into
+resident windows, keeps one shared host/device \code{weights} BO live for the
+whole window, and uses per-batch taps to address slices of larger host buffers.
+Crucially, the tile-side \code{ObjectFifo} payloads remain one-batch wide:
+making the tile FIFOs themselves window-sized immediately overflowed local
+SRAM, so the only scalable pattern is ``large host buffers, small tile buffers,
+repeated taps''. The current conservative default is
+\code{--window-batches 5}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}rcrrr@{}}
+\toprule
+Window batches & Train batches & NPU calls & Img/s & ms/call \\
+\midrule
+1 & 10 & 10 & 371 & 19.5 \\
+5 & 10 & 2 & 470 & 78.5 \\
+5 & 100 & 20 & 456 & 84.7 \\
+\bottomrule
+\end{tabular}
+\caption{Resident-window \code{simplecnn} probes on hardware. The first row is
+the same resident host path forced back to \code{window\_batches=1}; the later
+rows show the validated default \code{window\_batches=5}.}
+\label{tab:simplecnn-resident-window}
+\end{table}
+
+This is real progress, but it is not yet the fully overlapped edge-detect-style
+win. The current workers still execute forward and backward for one batch before
+advancing to the next microbatch, and the graph still uses depth-1 FIFOs. So
+the gain above comes mainly from reducing host launches and host-visible weight
+traffic, not from a true multi-batch in-array pipeline. Stable windows are
+currently verified through five microbatches; \code{window\_batches=8} already
+compiles but still times out at runtime.
 
 This makes the current interpretation straightforward. The one-column convnet is
 not yet a useful MNIST baseline, but it \emph{is} a useful systems baseline. It
 shows that a much simpler four-tile training graph can now be compiled,
-validated against a quantized CPU replay, and run stably for many epochs on the
-NPU. The remaining work is now about model quality and on-device residency, not
+validated against a quantized CPU replay, run stably for many epochs, and now
+also execute short resident windows with measurably lower host overhead. The
+remaining work is now about model quality and true in-array overlap, not
 whether the basic forward/backward/update path is functioning.
 
 \section{Compact glossary}

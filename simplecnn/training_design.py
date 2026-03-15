@@ -2,6 +2,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron.controlflow import range_
 from aie.iron.device import NPU2, Tile
 from aie.iron.placers import SequentialPlacer
 from aie.helpers.taplib.tap import TensorAccessPattern
@@ -30,8 +31,9 @@ from simplecnn.config import (
     TOTAL_WEIGHT_ELEMS,
     WEIGHT_OFFSETS,
 )
-def simplecnn_training_pipeline(archive_name, sgd_lr=0.0005):
+def simplecnn_training_pipeline(archive_name, sgd_lr=0.0005, window_batches=1):
     del sgd_lr
+    assert window_batches >= 1
 
     img_ty = np.ndarray[(IMG_ELEMS,), np.dtype[bfloat16]]
     act1_ty = np.ndarray[(ACT1_ELEMS,), np.dtype[bfloat16]]
@@ -50,7 +52,8 @@ def simplecnn_training_pipeline(archive_name, sgd_lr=0.0005):
     ckpt3_ty = np.ndarray[(CONV3_CKPT_ELEMS,), np.dtype[bfloat16]]
 
     labels_ty = np.ndarray[(BATCH_SIZE,), np.dtype[np.int32]]
-    labels_io_ty = np.ndarray[(LABELS_IO_ELEMS,), np.dtype[np.int32]]
+    host_img_ty = np.ndarray[(window_batches * IMG_ELEMS,), np.dtype[bfloat16]]
+    labels_io_ty = np.ndarray[(window_batches * LABELS_IO_ELEMS,), np.dtype[np.int32]]
     d_logits_ty = np.ndarray[(BATCH_SIZE * N_CLASSES,), np.dtype[bfloat16]]
 
     conv1_fwd = Kernel(
@@ -167,19 +170,24 @@ def simplecnn_training_pipeline(archive_name, sgd_lr=0.0005):
     ):
         w = of_w.acquire(1)
         try:
-            x = of_img.acquire(1)
-            y = of_act1.acquire(1)
-            ckpt = of_ckpt_prod.acquire(1)
-            fwd_k(x, w, y, ckpt)
-            of_img.release(1)
-            of_act1.release(1)
-            of_ckpt_prod.release(1)
+            window_loop = range(1)
+            if window_batches > 1:
+                window_loop = range_(window_batches)
 
-            gy = of_grad1.acquire(1)
-            ckpt_read = of_ckpt_cons.acquire(1)
-            bwd_k(ckpt_read, w, gy)
-            of_grad1.release(1)
-            of_ckpt_cons.release(1)
+            for _ in window_loop:
+                x = of_img.acquire(1)
+                y = of_act1.acquire(1)
+                ckpt = of_ckpt_prod.acquire(1)
+                fwd_k(x, w, y, ckpt)
+                of_img.release(1)
+                of_act1.release(1)
+                of_ckpt_prod.release(1)
+
+                gy = of_grad1.acquire(1)
+                ckpt_read = of_ckpt_cons.acquire(1)
+                bwd_k(ckpt_read, w, gy)
+                of_grad1.release(1)
+                of_ckpt_cons.release(1)
 
             w_out = of_w_out.acquire(1)
             copy_k(w, w_out)
@@ -202,21 +210,26 @@ def simplecnn_training_pipeline(archive_name, sgd_lr=0.0005):
     ):
         w = of_w.acquire(1)
         try:
-            x = of_in.acquire(1)
-            y = of_out.acquire(1)
-            ckpt = of_ckpt_prod.acquire(1)
-            fwd_k(x, w, y, ckpt)
-            of_in.release(1)
-            of_out.release(1)
-            of_ckpt_prod.release(1)
+            window_loop = range(1)
+            if window_batches > 1:
+                window_loop = range_(window_batches)
 
-            gy = of_grad_in.acquire(1)
-            gx = of_grad_out.acquire(1)
-            ckpt_read = of_ckpt_cons.acquire(1)
-            bwd_k(ckpt_read, w, gy, gx)
-            of_grad_in.release(1)
-            of_grad_out.release(1)
-            of_ckpt_cons.release(1)
+            for _ in window_loop:
+                x = of_in.acquire(1)
+                y = of_out.acquire(1)
+                ckpt = of_ckpt_prod.acquire(1)
+                fwd_k(x, w, y, ckpt)
+                of_in.release(1)
+                of_out.release(1)
+                of_ckpt_prod.release(1)
+
+                gy = of_grad_in.acquire(1)
+                gx = of_grad_out.acquire(1)
+                ckpt_read = of_ckpt_cons.acquire(1)
+                bwd_k(ckpt_read, w, gy, gx)
+                of_grad_in.release(1)
+                of_grad_out.release(1)
+                of_ckpt_cons.release(1)
 
             w_out = of_w_out.acquire(1)
             copy_k(w, w_out)
@@ -245,33 +258,38 @@ def simplecnn_training_pipeline(archive_name, sgd_lr=0.0005):
     ):
         w = of_w.acquire(1)
         try:
-            x = of_in.acquire(1)
-            act3 = of_act3_prod.acquire(1)
-            ckpt = of_ckpt_prod.acquire(1)
-            fwd_k(x, w, act3, ckpt)
-            of_in.release(1)
-            of_act3_prod.release(1)
-            of_ckpt_prod.release(1)
+            window_loop = range(1)
+            if window_batches > 1:
+                window_loop = range_(window_batches)
 
-            act3_read = of_act3_cons.acquire(1)
-            pooled = of_pooled_out.acquire(1)
-            gap_fwd_k(act3_read, pooled)
-            of_act3_cons.release(1)
-            of_pooled_out.release(1)
+            for _ in window_loop:
+                x = of_in.acquire(1)
+                act3 = of_act3_prod.acquire(1)
+                ckpt = of_ckpt_prod.acquire(1)
+                fwd_k(x, w, act3, ckpt)
+                of_in.release(1)
+                of_act3_prod.release(1)
+                of_ckpt_prod.release(1)
 
-            d_pooled = of_d_pooled_in.acquire(1)
-            grad3 = of_grad3_prod.acquire(1)
-            gap_bwd_k(d_pooled, grad3)
-            of_d_pooled_in.release(1)
-            of_grad3_prod.release(1)
+                act3_read = of_act3_cons.acquire(1)
+                pooled = of_pooled_out.acquire(1)
+                gap_fwd_k(act3_read, pooled)
+                of_act3_cons.release(1)
+                of_pooled_out.release(1)
 
-            grad3_read = of_grad3_cons.acquire(1)
-            grad2 = of_grad_out.acquire(1)
-            ckpt_read = of_ckpt_cons.acquire(1)
-            bwd_k(ckpt_read, w, grad3_read, grad2)
-            of_grad3_cons.release(1)
-            of_grad_out.release(1)
-            of_ckpt_cons.release(1)
+                d_pooled = of_d_pooled_in.acquire(1)
+                grad3 = of_grad3_prod.acquire(1)
+                gap_bwd_k(d_pooled, grad3)
+                of_d_pooled_in.release(1)
+                of_grad3_prod.release(1)
+
+                grad3_read = of_grad3_cons.acquire(1)
+                grad2 = of_grad_out.acquire(1)
+                ckpt_read = of_ckpt_cons.acquire(1)
+                bwd_k(ckpt_read, w, grad3_read, grad2)
+                of_grad3_cons.release(1)
+                of_grad_out.release(1)
+                of_ckpt_cons.release(1)
 
             w_out = of_w_out.acquire(1)
             copy_k(w, w_out)
@@ -294,21 +312,26 @@ def simplecnn_training_pipeline(archive_name, sgd_lr=0.0005):
     ):
         w = of_head_w.acquire(1)
         try:
-            pooled_in = of_pooled_in.acquire(1)
-            labels = of_labels.acquire(1)
-            d_logits = of_dlogits_prod.acquire(1)
-            preds = of_preds.acquire(1)
-            head_fwd_k(pooled_in, w, labels, d_logits, preds)
-            of_labels.release(1)
-            of_dlogits_prod.release(1)
-            of_preds.release(1)
+            window_loop = range(1)
+            if window_batches > 1:
+                window_loop = range_(window_batches)
 
-            d_logits_read = of_dlogits_cons.acquire(1)
-            d_pooled_out = of_d_pooled_out.acquire(1)
-            head_bwd_k(pooled_in, w, d_logits_read, d_pooled_out)
-            of_dlogits_cons.release(1)
-            of_d_pooled_out.release(1)
-            of_pooled_in.release(1)
+            for _ in window_loop:
+                pooled_in = of_pooled_in.acquire(1)
+                labels = of_labels.acquire(1)
+                d_logits = of_dlogits_prod.acquire(1)
+                preds = of_preds.acquire(1)
+                head_fwd_k(pooled_in, w, labels, d_logits, preds)
+                of_labels.release(1)
+                of_dlogits_prod.release(1)
+                of_preds.release(1)
+
+                d_logits_read = of_dlogits_cons.acquire(1)
+                d_pooled_out = of_d_pooled_out.acquire(1)
+                head_bwd_k(pooled_in, w, d_logits_read, d_pooled_out)
+                of_dlogits_cons.release(1)
+                of_d_pooled_out.release(1)
+                of_pooled_in.release(1)
 
             w_out = of_head_w_out.acquire(1)
             copy_k(w, w_out)
@@ -404,65 +427,97 @@ def simplecnn_training_pipeline(archive_name, sgd_lr=0.0005):
             [0, 1],
         )
 
-    labels_in_tap = TensorAccessPattern(
-        (1, LABELS_IO_ELEMS),
-        0,
-        [1, BATCH_SIZE],
-        [0, 1],
-    )
-    preds_out_tap = TensorAccessPattern(
-        (1, LABELS_IO_ELEMS),
-        BATCH_SIZE,
-        [1, BATCH_SIZE],
-        [0, 1],
-    )
+    def labels_in_tap(batch_idx: int) -> TensorAccessPattern:
+        return TensorAccessPattern(
+            (1, window_batches * LABELS_IO_ELEMS),
+            batch_idx * LABELS_IO_ELEMS,
+            [1, BATCH_SIZE],
+            [0, 1],
+        )
+
+    def preds_out_tap(batch_idx: int) -> TensorAccessPattern:
+        return TensorAccessPattern(
+            (1, window_batches * LABELS_IO_ELEMS),
+            batch_idx * LABELS_IO_ELEMS + BATCH_SIZE,
+            [1, BATCH_SIZE],
+            [0, 1],
+        )
+
+    def img_tap(batch_idx: int) -> TensorAccessPattern:
+        return TensorAccessPattern(
+            (1, window_batches * IMG_ELEMS),
+            batch_idx * IMG_ELEMS,
+            [1, IMG_ELEMS],
+            [0, 1],
+        )
 
     rt = Runtime()
-    with rt.sequence(img_ty, host_weights_ty, host_weights_ty, labels_io_ty) as (
+    with rt.sequence(host_img_ty, host_weights_ty, labels_io_ty) as (
         images,
-        weights_in,
-        weights_out,
+        weights,
         labels_io,
     ):
         rt.start(*workers)
 
-        tg = rt.task_group()
-        rt.fill(img_fifo.prod(), images, task_group=tg)
-        rt.fill(conv1_w_fifo.prod(), weights_in, tap=weight_tap(WEIGHT_OFFSETS.conv1, CONV1_W_ELEMS), task_group=tg)
-        rt.fill(conv2_w_fifo.prod(), weights_in, tap=weight_tap(WEIGHT_OFFSETS.conv2, CONV2_W_ELEMS), task_group=tg)
-        rt.fill(conv3_w_fifo.prod(), weights_in, tap=weight_tap(WEIGHT_OFFSETS.conv3, CONV3_W_ELEMS), task_group=tg)
-        rt.fill(head_w_fifo.prod(), weights_in, tap=weight_tap(WEIGHT_OFFSETS.head, HEAD_W_ELEMS), task_group=tg)
-        rt.fill(labels_fifo.prod(), labels_io, tap=labels_in_tap, task_group=tg)
-
-        rt.drain(preds_fifo.cons(), labels_io, tap=preds_out_tap, task_group=tg)
-        rt.drain(
-            conv1_w_out_fifo.cons(),
-            weights_out,
-            tap=weight_tap(WEIGHT_OFFSETS.conv1, CONV1_W_ELEMS),
-            wait=True,
-            task_group=tg,
-        )
-        rt.drain(
-            conv2_w_out_fifo.cons(),
-            weights_out,
-            tap=weight_tap(WEIGHT_OFFSETS.conv2, CONV2_W_ELEMS),
-            wait=True,
-            task_group=tg,
-        )
-        rt.drain(
-            conv3_w_out_fifo.cons(),
-            weights_out,
-            tap=weight_tap(WEIGHT_OFFSETS.conv3, CONV3_W_ELEMS),
-            wait=True,
-            task_group=tg,
-        )
-        rt.drain(
-            head_w_out_fifo.cons(),
-            weights_out,
-            tap=weight_tap(WEIGHT_OFFSETS.head, HEAD_W_ELEMS),
-            wait=True,
-            task_group=tg,
-        )
-        rt.finish_task_group(tg)
+        for batch_idx in range(window_batches):
+            tg = rt.task_group()
+            rt.fill(img_fifo.prod(), images, tap=img_tap(batch_idx), task_group=tg)
+            if batch_idx == 0:
+                rt.fill(
+                    conv1_w_fifo.prod(),
+                    weights,
+                    tap=weight_tap(WEIGHT_OFFSETS.conv1, CONV1_W_ELEMS),
+                    task_group=tg,
+                )
+                rt.fill(
+                    conv2_w_fifo.prod(),
+                    weights,
+                    tap=weight_tap(WEIGHT_OFFSETS.conv2, CONV2_W_ELEMS),
+                    task_group=tg,
+                )
+                rt.fill(
+                    conv3_w_fifo.prod(),
+                    weights,
+                    tap=weight_tap(WEIGHT_OFFSETS.conv3, CONV3_W_ELEMS),
+                    task_group=tg,
+                )
+                rt.fill(
+                    head_w_fifo.prod(),
+                    weights,
+                    tap=weight_tap(WEIGHT_OFFSETS.head, HEAD_W_ELEMS),
+                    task_group=tg,
+                )
+            rt.fill(labels_fifo.prod(), labels_io, tap=labels_in_tap(batch_idx), task_group=tg)
+            rt.drain(preds_fifo.cons(), labels_io, tap=preds_out_tap(batch_idx), task_group=tg)
+            if batch_idx == window_batches - 1:
+                rt.drain(
+                    conv1_w_out_fifo.cons(),
+                    weights,
+                    tap=weight_tap(WEIGHT_OFFSETS.conv1, CONV1_W_ELEMS),
+                    wait=True,
+                    task_group=tg,
+                )
+                rt.drain(
+                    conv2_w_out_fifo.cons(),
+                    weights,
+                    tap=weight_tap(WEIGHT_OFFSETS.conv2, CONV2_W_ELEMS),
+                    wait=True,
+                    task_group=tg,
+                )
+                rt.drain(
+                    conv3_w_out_fifo.cons(),
+                    weights,
+                    tap=weight_tap(WEIGHT_OFFSETS.conv3, CONV3_W_ELEMS),
+                    wait=True,
+                    task_group=tg,
+                )
+                rt.drain(
+                    head_w_out_fifo.cons(),
+                    weights,
+                    tap=weight_tap(WEIGHT_OFFSETS.head, HEAD_W_ELEMS),
+                    wait=True,
+                    task_group=tg,
+                )
+            rt.finish_task_group(tg)
 
     return Program(NPU2(), rt).resolve_program(SequentialPlacer())

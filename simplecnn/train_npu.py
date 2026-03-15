@@ -11,7 +11,7 @@ from torchvision import datasets, transforms
 
 from iron.common.aie_context import AIEContext
 
-from simplecnn.config import BATCH_SIZE, TOTAL_WEIGHT_ELEMS
+from simplecnn.config import BATCH_SIZE, IMG_ELEMS, LABELS_IO_ELEMS, TOTAL_WEIGHT_ELEMS
 from simplecnn.model import TinyConvNet
 from simplecnn.training_op import SimpleCNNTrainingPipeline
 
@@ -58,37 +58,74 @@ def evaluate_model(model, loader, criterion, max_batches=None):
     return total_loss / total, correct / total
 
 
-def run_epoch(model, loader, npu_op, packed_weights, max_batches=None):
+def run_epoch(model, loader, npu_op, packed_weights, max_batches=None, window_batches=1):
+    del model
     correct = 0
     total = 0
     npu_time = 0.0
     npu_calls = 0
+    weights_initialized = False
+    loader_iter = iter(loader)
+    batch_idx = 0
+    zero_images = np.zeros(IMG_ELEMS, dtype=bfloat16)
 
-    for batch_idx, (images, labels) in enumerate(loader):
-        images_np = images.numpy().astype(np.float32).astype(bfloat16, copy=False).reshape(-1)
-        labels_io = np.full(2 * BATCH_SIZE, -1, dtype=np.int32)
-        labels_io[:BATCH_SIZE] = labels.numpy().astype(np.int32, copy=False)
+    while True:
+        batch_group = []
+        while len(batch_group) < window_batches:
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            try:
+                batch_group.append(next(loader_iter))
+            except StopIteration:
+                break
+            batch_idx += 1
 
-        npu_op.write_buffer("images", images_np)
-        npu_op.write_buffer("weights_in", packed_weights)
-        npu_op.write_buffer("weights_out", np.zeros(TOTAL_WEIGHT_ELEMS, dtype=bfloat16))
+        if not batch_group:
+            break
+
+        image_tiles = []
+        labels_list = []
+        labels_io = np.full(window_batches * LABELS_IO_ELEMS, -1, dtype=np.int32)
+        for group_idx, (images, labels) in enumerate(batch_group):
+            images_np = images.numpy().astype(np.float32).astype(bfloat16, copy=False).reshape(-1)
+            labels_np = labels.numpy().astype(np.int32, copy=False)
+            image_tiles.append(images_np)
+            labels_list.append(labels_np)
+            offset = group_idx * LABELS_IO_ELEMS
+            labels_io[offset : offset + BATCH_SIZE] = labels_np
+
+        while len(image_tiles) < window_batches:
+            image_tiles.append(zero_images)
+
+        if not weights_initialized:
+            npu_op.write_buffer("weights", packed_weights)
+        npu_op.write_buffer("images", np.concatenate(image_tiles))
         npu_op.write_buffer("labels_io", labels_io)
 
-        t0 = time.perf_counter()
-        npu_op.run_runlist()
-        npu_time += time.perf_counter() - t0
+        npu_time += npu_op.run_resident_window(
+            sync_weights_to_device=not weights_initialized,
+            sync_weights_from_device=False,
+        )
         npu_calls += 1
+        weights_initialized = True
 
-        packed_weights = npu_op.read_buffer("weights_out", (TOTAL_WEIGHT_ELEMS,), copy=True)
+        labels_out = npu_op.read_buffer(
+            "labels_io",
+            (window_batches * LABELS_IO_ELEMS,),
+            copy=True,
+            dtype=np.int32,
+        )
+        preds = labels_out.reshape(window_batches, LABELS_IO_ELEMS)[:, BATCH_SIZE:].reshape(-1)
+        for group_idx, labels_np in enumerate(labels_list):
+            pred_slice = preds[group_idx * BATCH_SIZE : (group_idx + 1) * BATCH_SIZE]
+            correct += int((pred_slice == labels_np).sum())
+            total += BATCH_SIZE
+
+    if weights_initialized:
+        npu_op.sync_resident_weights_from_device()
+        packed_weights = npu_op.read_buffer("weights", (TOTAL_WEIGHT_ELEMS,), copy=True)
         if not np.isfinite(np.asarray(packed_weights, dtype=np.float32)).all():
-            raise RuntimeError(f"weights became non-finite at batch {batch_idx}")
-        labels_out = npu_op.read_buffer("labels_io", (2 * BATCH_SIZE,), copy=True, dtype=np.int32)
-        preds = labels_out[BATCH_SIZE:]
-        correct += int((preds == labels.numpy()).sum())
-        total += BATCH_SIZE
-
-        if max_batches is not None and batch_idx + 1 >= max_batches:
-            break
+            raise RuntimeError("weights became non-finite during resident simplecnn training")
 
     return {
         "train_loss": None,
@@ -106,6 +143,7 @@ def main():
     parser.add_argument("--conv-scale", type=float, default=1.0)
     parser.add_argument("--head-scale", type=float, default=1.0)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--window-batches", type=int, default=5)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
     parser.add_argument("--save-dir", type=str, default="simplecnn/checkpoints")
@@ -122,12 +160,17 @@ def main():
     print(f"Model: {total_params:,} parameters")
     print("  architecture: 3 stride-2 convs + GAP + linear (top-1 hinge head)")
     print(f"  lr_npu: {args.lr_npu}")
+    print(f"  resident window_batches: {args.window_batches}")
     print(f"  conv/head scales: {args.conv_scale:g} / {args.head_scale:g}")
 
     print("\nCompiling NPU pipeline (1 column, 4 tiles)...", flush=True)
     t0 = time.time()
-    ctx = AIEContext()
-    npu_op = SimpleCNNTrainingPipeline(sgd_lr=args.lr_npu, context=ctx)
+    ctx = AIEContext(use_runlist=False)
+    npu_op = SimpleCNNTrainingPipeline(
+        sgd_lr=args.lr_npu,
+        window_batches=args.window_batches,
+        context=ctx,
+    )
     ctx.compile_all()
     ctx.prepare_runtime()
     print(f"  Compiled in {time.time() - t0:.1f}s")
@@ -150,6 +193,7 @@ def main():
             npu_op,
             packed_weights,
             max_batches=args.max_train_batches,
+            window_batches=args.window_batches,
         )
         packed_weights = stats["packed_weights"]
         model.load_packed_weights(packed_weights)

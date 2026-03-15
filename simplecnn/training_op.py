@@ -1,4 +1,7 @@
 from pathlib import Path
+import time
+
+from iron.common.aie_device_manager import pyxrt
 
 from iron.common import (
     AIEOperatorBase,
@@ -24,9 +27,11 @@ from simplecnn.config import (
 
 
 class SimpleCNNTrainingPipeline(AIEOperatorBase):
-    def __init__(self, sgd_lr=0.0005, context=None):
+    def __init__(self, sgd_lr=0.0005, window_batches=1, context=None):
         self.B = BATCH_SIZE
         self.sgd_lr = sgd_lr
+        self.window_batches = window_batches
+        self._insts_synced = False
         super().__init__(context=context)
 
     def get_artifacts(self, prefix="simplecnn_training_"):
@@ -65,10 +70,14 @@ class SimpleCNNTrainingPipeline(AIEOperatorBase):
             f"simplecnn_training_kernels_c1{C1}_c2{C2}_c3{C3}_{lr_tag}_{kernel_fp}.a"
         )
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{prefix}b{self.B}_{lr_tag}_{build_fp}.mlir",
+            f"{prefix}b{self.B}_w{self.window_batches}_{lr_tag}_{build_fp}.mlir",
             import_path=operator_dir / "training_design.py",
             callback_fn="simplecnn_training_pipeline",
-            callback_kwargs={"archive_name": archive_name, "sgd_lr": self.sgd_lr},
+            callback_kwargs={
+                "archive_name": archive_name,
+                "sgd_lr": self.sgd_lr,
+                "window_batches": self.window_batches,
+            },
             requires_context=False,
         )
 
@@ -83,7 +92,7 @@ class SimpleCNNTrainingPipeline(AIEOperatorBase):
         ]
 
         xclbin_artifact = XclbinArtifact.new(
-            f"{prefix}b{self.B}_{lr_tag}_{build_fp}.xclbin",
+            f"{prefix}b{self.B}_w{self.window_batches}_{lr_tag}_{build_fp}.xclbin",
             depends=[
                 mlir_artifact,
                 KernelArchiveArtifact.new(
@@ -145,7 +154,7 @@ class SimpleCNNTrainingPipeline(AIEOperatorBase):
         )
 
         insts_artifact = InstsBinArtifact.new(
-            f"{prefix}b{self.B}_{lr_tag}_{build_fp}.bin",
+            f"{prefix}b{self.B}_w{self.window_batches}_{lr_tag}_{build_fp}.bin",
             depends=[mlir_artifact],
         )
         return xclbin_artifact, insts_artifact
@@ -163,14 +172,58 @@ class SimpleCNNTrainingPipeline(AIEOperatorBase):
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_buffer("images", IMG_ELEMS)
-        self.add_buffer("weights_in", TOTAL_WEIGHT_ELEMS)
-        self.add_buffer("weights_out", TOTAL_WEIGHT_ELEMS)
-        self.add_buffer("labels_io", LABELS_IO_ELEMS, dtype="int32")
+        self.add_buffer("images", self.window_batches * IMG_ELEMS)
+        self.add_buffer("weights", TOTAL_WEIGHT_ELEMS)
+        self.add_buffer("labels_io", self.window_batches * LABELS_IO_ELEMS, dtype="int32")
         self.add_to_runlist(
             "simplecnn_training",
             "images",
-            "weights_in",
-            "weights_out",
+            "weights",
             "labels_io",
+        )
+
+    def _run_args(self):
+        return (
+            self.buffer_bos["images"],
+            self.buffer_bos["weights"],
+            self.buffer_bos["labels_io"],
+        )
+
+    def _sync_buffers(self, names, direction):
+        for name in names:
+            self.buffer_bos[name].sync(direction)
+
+    def run_resident_window(self, *, sync_weights_to_device=False, sync_weights_from_device=False):
+        _, xrt_kernel, insts_bo, insts_len = self.xrt_kernels["simplecnn_training"]
+        if not self._insts_synced:
+            insts_bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            self._insts_synced = True
+
+        sync_to_device = ["images", "labels_io"]
+        if sync_weights_to_device:
+            sync_to_device.append("weights")
+        self._sync_buffers(sync_to_device, pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+
+        start = time.perf_counter()
+        run = xrt_kernel(3, insts_bo, insts_len, *self._run_args())
+        result = run.wait()
+        elapsed = time.perf_counter() - start
+        if result != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+            raise RuntimeError(
+                f"Kernel simplecnn_training did not complete correctly: {result}"
+            )
+
+        sync_from_device = ["labels_io"]
+        if sync_weights_from_device:
+            sync_from_device.append("weights")
+        self._sync_buffers(
+            sync_from_device,
+            pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE,
+        )
+        return elapsed
+
+    def sync_resident_weights_from_device(self):
+        self._sync_buffers(
+            ["weights"],
+            pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE,
         )
