@@ -35,7 +35,11 @@ def _load_embedded_weights(weights_path: str | Path, num_tiles: int, H: int):
 
 def _tail_stack_size_bytes(B: int, H: int) -> int:
     scratch_bytes = 2 * B * H + 4 * B * N_CLS_PADDED
-    stack_bytes = max(0x1000, scratch_bytes)
+    # The tail kernel keeps several tile-local scratch buffers on the worker
+    # stack. Budgeting only the raw array footprint is too tight once the
+    # compiler adds its own frame temporaries, which shows up as all-NaN logits
+    # at larger B values even though the design still compiles.
+    stack_bytes = max(0x2000, scratch_bytes + 0x1000)
     return ((stack_bytes + 0x7FF) // 0x800) * 0x800
 
 

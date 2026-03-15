@@ -13,10 +13,13 @@ from ml_dtypes import bfloat16
 from iron.common.aie_context import AIEContext
 
 from resmlp import from_tiled, to_tiled
-from resmlp.mnist_utils import (
+from resmlp.data_utils import (
     DEFAULT_SPLIT_SEED,
     DEFAULT_VAL_SIZE,
-    get_mnist_eval_dataset,
+    SUPPORTED_DATASETS,
+    get_dataset_config,
+    get_eval_dataset,
+    resolve_dataset_name,
     save_prediction_preview,
 )
 from resmlp.model import ResMLP
@@ -35,6 +38,7 @@ class ResidualStreamingInferenceService:
         *,
         hidden_dim=None,
         num_layers=None,
+        dataset=None,
         batch_size=None,
         npu_head=True,
         num_cols=8,
@@ -46,8 +50,12 @@ class ResidualStreamingInferenceService:
         self.num_tiles = num_cols * ROWS_PER_COL
         self.stream_depth = stream_depth
         self.npu_head = npu_head
+        self.dataset = resolve_dataset_name(dataset, ckpt.get("dataset"))
+        dataset_cfg = get_dataset_config(self.dataset)
         self.hidden_dim = hidden_dim if hidden_dim is not None else ckpt.get("hidden_dim", 160)
         self.num_layers = num_layers if num_layers is not None else ckpt.get("num_layers", 32)
+        self.input_dim = ckpt.get("input_dim", dataset_cfg["input_dim"])
+        self.num_classes = ckpt.get("num_classes", dataset_cfg["num_classes"])
         self.pipeline = ckpt.get("pipeline", "hybrid")
         self.epoch = ckpt["epoch"]
         self.eval_split = ckpt.get("eval_split", "test")
@@ -65,7 +73,12 @@ class ResidualStreamingInferenceService:
                 "used as residual layers or with 2 identity-padded endpoints."
             )
 
-        self.model = ResMLP(hidden_dim=self.hidden_dim, num_layers=self.num_layers)
+        self.model = ResMLP(
+            hidden_dim=self.hidden_dim,
+            num_layers=self.num_layers,
+            input_dim=self.input_dim,
+            num_classes=self.num_classes,
+        )
         self.model.load_state_dict(ckpt["model"])
         self.model.eval()
 
@@ -86,6 +99,11 @@ class ResidualStreamingInferenceService:
 
         ctx = AIEContext(use_runlist=False)
         if self.npu_head:
+            if self.num_classes != NUM_CLASSES:
+                raise ValueError(
+                    f"NPU logits head currently supports {NUM_CLASSES} classes, "
+                    f"but checkpoint uses {self.num_classes}; retry with --cpu-head"
+                )
             packed_head_weight = np.asarray(
                 to_tiled(self.model.export_head_weight(padded_classes=N_CLS_PADDED)),
                 dtype=bfloat16,
@@ -145,7 +163,9 @@ class ResidualStreamingInferenceService:
                 start = idx * self.B * N_CLS_PADDED
                 stop = (idx + 1) * self.B * N_CLS_PADDED
                 outputs.append(
-                    logits_flat[start:stop].reshape(self.B, N_CLS_PADDED)[:, :NUM_CLASSES].astype(np.float32)
+                    logits_flat[start:stop]
+                    .reshape(self.B, N_CLS_PADDED)[:, : self.num_classes]
+                    .astype(np.float32)
                 )
         else:
             hidden_flat = self.npu_op.read_buffer(
@@ -222,7 +242,13 @@ class ResidualStreamingInferenceService:
         }
 
 
-def mnist_batch_iterator(dataset, batch_size):
+def success_exit_code(observed_acc, expected_acc, *, partial_run=False):
+    if partial_run or expected_acc is None:
+        return 0
+    return 0 if observed_acc >= max(0.0, expected_acc - 0.10) else 1
+
+
+def dataset_batch_iterator(dataset, batch_size):
     total = len(dataset)
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
@@ -236,10 +262,11 @@ def mnist_batch_iterator(dataset, batch_size):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Streaming MNIST inference on NPU")
+    parser = argparse.ArgumentParser(description="Streaming dataset inference on NPU")
     parser.add_argument("checkpoint", help="Path to trained .pt checkpoint")
     parser.add_argument("--hidden-dim", type=int, default=None)
     parser.add_argument("--num-layers", type=int, default=None)
+    parser.add_argument("--dataset", choices=SUPPORTED_DATASETS, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--cpu-head", action="store_true",
                         help="Use the body-only streamer and run the classifier head on the host")
@@ -266,13 +293,14 @@ def main():
         args.checkpoint,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
+        dataset=args.dataset,
         batch_size=args.batch_size,
         npu_head=not args.cpu_head,
         num_cols=args.num_cols,
         stream_depth=args.stream_depth,
     )
     print(
-        f"  pipeline={service.pipeline}, epoch={service.epoch}, "
+        f"  dataset={service.dataset}, pipeline={service.pipeline}, epoch={service.epoch}, "
         f"saved {service.eval_split} acc={service.saved_eval_acc}"
     )
     print(
@@ -281,7 +309,8 @@ def main():
     )
 
     eval_split = args.eval_split or service.eval_split
-    eval_ds = get_mnist_eval_dataset(
+    eval_ds = get_eval_dataset(
+        service.dataset,
         split=eval_split,
         data_dir=args.data_dir,
         val_size=service.val_size,
@@ -289,7 +318,7 @@ def main():
     )
 
     if args.bench_images is not None:
-        repeated_images, _, _ = next(mnist_batch_iterator(eval_ds, service.B))
+        repeated_images, _, _ = next(dataset_batch_iterator(eval_ds, service.B))
         stats = service.benchmark(repeated_images, args.bench_images)
         print("\nRepeated-image benchmark:")
         for key in (
@@ -313,7 +342,7 @@ def main():
     preview_labels = []
     preview_preds = []
 
-    batch_iter = mnist_batch_iterator(eval_ds, service.B)
+    batch_iter = dataset_batch_iterator(eval_ds, service.B)
     consumed_batches = 0
     while True:
         batch_group = []
@@ -360,13 +389,17 @@ def main():
 
     preview_out = args.preview_out
     if args.preview_samples > 0 and preview_out is None:
-        preview_out = str(Path("build") / f"streaming_{eval_split}_preview_h{service.hidden_dim}_b{service.B}.png")
+        preview_out = str(
+            Path("build")
+            / f"streaming_{service.dataset}_{eval_split}_preview_h{service.hidden_dim}_b{service.B}.png"
+        )
     if preview_out is not None and preview_labels:
         preview_path = save_prediction_preview(
             torch.cat(preview_images, dim=0),
             preview_labels,
             preview_preds,
             preview_out,
+            dataset_name=service.dataset,
             max_items=args.preview_samples,
         )
         print(f"Preview: {preview_path}")
@@ -378,7 +411,11 @@ def main():
         print(f"  NPU calls:   {npu_calls}")
         print(f"  Throughput:  {total / npu_time:.0f} images/sec (NPU only)")
 
-    return 0 if accuracy > 0.90 else 1
+    return success_exit_code(
+        accuracy,
+        service.saved_eval_acc if eval_split == service.eval_split else None,
+        partial_run=args.max_batches is not None,
+    )
 
 
 if __name__ == "__main__":

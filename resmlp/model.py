@@ -2,9 +2,9 @@
 PyTorch model for the residual MLP.
 
 Architecture:
-    784 (MNIST) → Linear → H
+    D (flattened image input) → Linear → H
     [y = relu(x @ W_i) + x]  × N layers   (NPU)
-    H → Linear → 10 classes
+    H → Linear → C classes
 
     The number of residual layers is configurable so the same class can model
     both the 32-layer hybrid pipeline and the 30-layer full-NPU pipeline.
@@ -31,13 +31,13 @@ class ResidualLinear(nn.Module):
 
 
 class ResMLP(nn.Module):
-    """Residual MLP for MNIST classification.
+    """Residual MLP for image classification.
 
     Args:
         hidden_dim: Width of all hidden layers (must match NPU tile dimension).
         num_layers: Number of residual layers (must match number of NPU tiles).
         num_classes: Number of output classes.
-        input_dim: Input feature dimension (784 for MNIST).
+        input_dim: Flattened input feature dimension.
     """
 
     def __init__(self, hidden_dim=160, num_layers=32,
@@ -50,7 +50,7 @@ class ResMLP(nn.Module):
         self.head = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)   # flatten MNIST images
+        x = x.view(x.size(0), -1)
         x = self.embed(x)
         for layer in self.layers:
             x = layer(x)

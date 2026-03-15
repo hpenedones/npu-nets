@@ -1,5 +1,5 @@
 """
-Train ResMLP on MNIST with NPU acceleration.
+Train ResMLP on image datasets with NPU acceleration.
 
 Two training modes are supported:
 
@@ -24,12 +24,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 from ml_dtypes import bfloat16
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
 
 from aie.utils import DefaultNPURuntime
 from iron.common.aie_context import AIEContext
 from resmlp import from_tiled, to_tiled
+from resmlp.data_utils import (
+    SUPPORTED_DATASETS,
+    get_dataset_config,
+    get_dataset_dataloaders,
+    resolve_dataset_name,
+)
 from resmlp.model import ResMLP
 from resmlp.training_design import ROWS_PER_COL
 from resmlp.training_full_design import N_CLS_PADDED, residual_drainback_enabled
@@ -47,22 +51,6 @@ FULL_NPU_CLI_HARD_EXIT = False
 FULL_NPU_WEIGHT_CHECK_INTERVAL = 20
 SMALLH_RESIDENT_MAX_H = 16
 SMALLH_RESIDENT_DEFAULT_WINDOW_BATCHES = 64
-
-
-def get_dataloaders(batch_size, data_dir="data", num_workers=2, pin_memory=True):
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-    ])
-    train_ds = datasets.MNIST(data_dir, train=True, download=True,
-                              transform=transform)
-    test_ds = datasets.MNIST(data_dir, train=False, transform=transform)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=pin_memory,
-                              drop_last=True)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                             num_workers=num_workers, pin_memory=pin_memory)
-    return train_loader, test_loader
 
 
 def cpu_forward_residual(x_np, weights_bf16):
@@ -554,7 +542,7 @@ def run_full_npu_epoch(model, train_loader,
 
 def main():
     global FULL_NPU_CLI_HARD_EXIT
-    parser = argparse.ArgumentParser(description="Train ResMLP on MNIST with NPU")
+    parser = argparse.ArgumentParser(description="Train ResMLP on a dataset with NPU acceleration")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--pipeline", choices=["hybrid", "full-npu"], default="hybrid")
     parser.add_argument("--lr-head", type=float, default=1e-3,
@@ -566,6 +554,8 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=160)
     parser.add_argument("--num-layers", type=int, default=None)
     parser.add_argument("--num-cols", type=int, default=8)
+    parser.add_argument("--dataset", choices=SUPPORTED_DATASETS, default=None)
+    parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--weight-scale", type=float, default=0.02,
                         help="Initial weight scale for residual layers")
     parser.add_argument("--embed-scale", type=float, default=None,
@@ -637,10 +627,35 @@ def main():
         args.weight_clip_max_abs = REDUCED_SHAPE_WEIGHT_CLIP_MAX_ABS
     FULL_NPU_CLI_HARD_EXIT = args.pipeline == "full-npu"
 
-    model = ResMLP(hidden_dim=H, num_layers=num_layers)
+    resume_ckpt = None
     if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu", weights_only=True)
-        model.load_state_dict(ckpt["model"])
+        resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=True)
+    dataset_name = resolve_dataset_name(
+        args.dataset,
+        resume_ckpt.get("dataset") if resume_ckpt else None,
+    )
+    dataset_cfg = get_dataset_config(dataset_name)
+    input_dim = resume_ckpt.get("input_dim", dataset_cfg["input_dim"]) if resume_ckpt else dataset_cfg["input_dim"]
+    num_classes = (
+        resume_ckpt.get("num_classes", dataset_cfg["num_classes"])
+        if resume_ckpt
+        else dataset_cfg["num_classes"]
+    )
+    if input_dim != dataset_cfg["input_dim"] or num_classes != dataset_cfg["num_classes"]:
+        raise ValueError(
+            f"Checkpoint/input metadata ({input_dim} inputs, {num_classes} classes) "
+            f"does not match dataset '{dataset_name}'"
+        )
+    args.dataset = dataset_name
+
+    model = ResMLP(
+        hidden_dim=H,
+        num_layers=num_layers,
+        input_dim=input_dim,
+        num_classes=num_classes,
+    )
+    if resume_ckpt:
+        model.load_state_dict(resume_ckpt["model"])
         print(f"Resumed from {args.resume}")
     else:
         with torch.no_grad():
@@ -656,7 +671,10 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     residual_params = sum(layer.weight.numel() for layer in model.layers)
     print(f"Model: {total_params:,} parameters")
+    print(f"  dataset: {dataset_name}")
     print(f"  pipeline: {args.pipeline}")
+    print(f"  embed: {input_dim} → {H}")
+    print(f"  head: {H} → {num_classes}")
     print(f"  residual layers: {num_layers}")
     if args.pipeline == "hybrid":
         print(f"  NPU residual: {residual_params:,}  ({num_layers} × {H}×{H})")
@@ -729,10 +747,15 @@ def main():
 
     loader_workers = 0 if args.pipeline == "full-npu" else 2
     loader_pin_memory = args.pipeline != "full-npu"
-    train_loader, test_loader = get_dataloaders(
+    train_loader, _, test_loader = get_dataset_dataloaders(
+        dataset_name,
         args.batch_size,
-        num_workers=loader_workers,
+        data_dir=args.data_dir,
+        val_size=0,
+        train_num_workers=loader_workers,
+        eval_num_workers=loader_workers,
         pin_memory=loader_pin_memory,
+        drop_last_train=True,
     )
 
     save_dir = Path(args.save_dir)
@@ -814,12 +837,15 @@ def main():
             torch.save({
                 "epoch": epoch,
                 "model": model.state_dict(),
+                "dataset": dataset_name,
                 "test_acc": test_acc,
                 "test_loss": test_loss,
                 "pipeline": args.pipeline,
                 "hidden_dim": H,
                 "num_layers": num_layers,
                 "num_cols": num_cols,
+                "input_dim": input_dim,
+                "num_classes": num_classes,
             }, path)
             print(f"    → saved {path}")
         elif args.pipeline == "full-npu" and epoch == args.epochs - 1:
@@ -828,10 +854,13 @@ def main():
             torch.save({
                 "epoch": epoch,
                 "model": model.state_dict(),
+                "dataset": dataset_name,
                 "pipeline": args.pipeline,
                 "hidden_dim": H,
                 "num_layers": num_layers,
                 "num_cols": num_cols,
+                "input_dim": input_dim,
+                "num_classes": num_classes,
             }, path)
             print(f"    → saved {path}")
 

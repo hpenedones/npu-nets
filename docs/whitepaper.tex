@@ -53,13 +53,14 @@
 \begin{abstract}
 This document is a compact tutorial and research note about co-designing a neural
 network for the AMD XDNA~2 NPU. The working example is deliberately simple: a
-32-layer residual MLP for MNIST, with one learnable weight matrix per
-compute tile and activations flowing through the full 32-tile array in a
-snake. The point is not that MNIST is hard, nor that this particular design
-reaches the hardware's peak throughput --- it does not. The point is that it is
-small enough to understand end to end, yet rich enough to expose the real
-constraints that matter on this hardware: local SRAM, MMUL-friendly data
-layouts, explicit FIFOs, and the cost of host--device orchestration.
+32-layer residual MLP, first mapped to MNIST and then retargeted to CIFAR-10,
+with one learnable weight matrix per compute tile and activations flowing
+through the full 32-tile array in a snake. The point is not that these tiny
+vision tasks are intrinsically hard, nor that the current design reaches the
+hardware's peak throughput --- it does not. The point is that it is small
+enough to understand end to end, yet rich enough to expose the real constraints
+that matter on this hardware: local SRAM, MMUL-friendly data layouts, explicit
+FIFOs, and the cost of host--device orchestration.
 \end{abstract}
 
 \section{Introduction}
@@ -76,14 +77,16 @@ This repository takes the hardware seriously. Instead of beginning with a large
 model and then asking how to squeeze it onto the device, we begin with the tile
 array and ask: what is the cleanest learnable network that maps onto it almost
 literally? The answer in the current main branch is a 32-layer residual MLP
-for MNIST:
+with one residual weight matrix per tile:
 \[
   h_{\ell+1} = \mathrm{ReLU}(h_{\ell} W_{\ell}) + h_{\ell}, \qquad \ell=0,\dots,31.
 \]
 Each of the 32 compute tiles stores exactly one residual weight matrix. In the
-main public $H=160$ split, the host CPU still runs the input embedding, while
-the NPU runs all 32 hidden layers and the final classification head in one
-streamed service.
+main public MNIST $H=160$ split, the host CPU still runs the input embedding,
+while the NPU runs all 32 hidden layers and the final classification head in
+one streamed service. The same residual template can then be retargeted to
+CIFAR-10 by widening the host-side input projection and moving to a narrower,
+higher-batch throughput point.
 
 The result is now a family of didactic but fully working examples:
 \begin{itemize}
@@ -94,7 +97,12 @@ The result is now a family of didactic but fully working examples:
   \item a narrower throughput-oriented $H=96$, $B=56$ variant reaches about
         97.3\% validation accuracy on a 50k/10k train/validation split, about
         739k images/s wall-clock in the current host-visible service, and about
-        3.88 million images/s if only NPU kernel wait time is counted.
+        3.88 million images/s if only NPU kernel wait time is counted,
+  \item a throughput-tuned CIFAR-10 $H=32$, $B=176$, \code{stream\_depth=64}
+        variant sustains about 747{,}851 images/s wall-clock over a 100M-image
+        run and about 3.06 million images/s if only NPU kernel wait time is
+        counted, with the CPU-side $3072\rightarrow32$ embed now dominating the
+        total wall time.
 \end{itemize}
 
 These numbers are intentionally modest relative to the NPU's peak. The current
@@ -273,8 +281,10 @@ The current model is intentionally plain. In the main $H=160$ streaming path,
 the CPU flattens a 28$\times$28 MNIST image and projects it to a
 160-dimensional hidden state. On the NPU, we apply 32 copies of the same layer
 shape, each with its own weights, and the final tile also projects the last
-hidden state to ten logits. A later subsection revisits the same 32-layer
-template at a narrower, higher-batch operating point ($H=96$, $B=56$).
+hidden state to ten logits. Later subsections revisit the same 32-layer
+template at narrower, higher-batch operating points for both MNIST
+($H=96$, $B=56$) and CIFAR-10 ($3072\rightarrow32$, $B=176$,
+\code{stream\_depth=64}).
 
 \begin{figure}[t]
 \centering
@@ -1161,6 +1171,41 @@ wall-clock figure therefore appears to be at least at the high end of the
 public MNIST throughput numbers we could find, but it should be read as a
 strong data point rather than an apples-to-apples claim of beating every
 published result.
+
+\subsection{A sustained CIFAR-10 throughput point}
+
+The same residual template also retargets cleanly to CIFAR-10. The highest
+wall-clock point we measured keeps the 32-tile snake intact, but changes the
+host-side projection to $3072\rightarrow32$, uses 32 residual layers of shape
+$32\times32$, and keeps the small $32\rightarrow10$ head on the final tile.
+That model has $3072\cdot32 + 32 = 98{,}336$ parameters in the embed,
+$32\cdot32\cdot32 = 32{,}768$ in the residual body, and $32\cdot10 + 10 = 330$
+in the head, for a total of 131{,}434 trainable parameters. One forward pass
+costs 262{,}784 FLOPs/image if only the matrix multiplies are counted, or about
+264{,}874 scalar floating-point operations/image if bias adds, ReLUs, and
+residual adds are included.
+
+Training this smaller model on CIFAR-10 is predictably less accurate than the
+wider MNIST-oriented shapes, but it remains nontrivial: the best checkpoint in
+the current run reaches 51.43\% validation accuracy and 51.20\% test accuracy.
+The best stable streaming operating point we measured is $B=176$ with
+\code{stream\_depth=64}$;$ pushing the same shape to
+\code{stream\_depth=128} currently runs into shim-DMA descriptor limits. On a
+repeated-image benchmark over 100{,}001{,}792 processed images, this
+configuration sustains 747{,}851 images/s wall-clock and 3.06 million
+images/s if only NPU kernel wait time is counted, corresponding to about
+0.20 / 0.81 TFLOPS if the full network forward pass is charged to the
+measurement.
+
+The most interesting lesson from this CIFAR-10 point is where the bottleneck
+moves. Over that 100M-image run, the host-side $3072\rightarrow32$ embed alone
+accounts for about 92.6~s of the 133.7~s wall time, while the NPU kernel itself
+accounts for about 32.7~s; the remaining few seconds are other host/runtime
+overhead. In other words, once the residual body is narrowed enough and the
+batch is pushed high enough, the resident 32-tile snake is no longer the
+limiting stage for throughput. The next systems win is not to squeeze a little
+more out of the tail worker, but to reduce or eliminate the CPU-side embed
+boundary.
 
 Taken together, these results are still strong while keeping the design
 conceptually modest:

@@ -1,5 +1,5 @@
 """
-Train the 32-layer residual MLP on MNIST.
+Train the residual MLP on image classification datasets.
 
 Usage:
     python resmlp/train.py                    # train from scratch
@@ -14,14 +14,17 @@ import sys
 import time
 from pathlib import Path
 
-import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch
 
-from resmlp.mnist_utils import (
+from resmlp.data_utils import (
     DEFAULT_SPLIT_SEED,
     DEFAULT_VAL_SIZE,
-    get_mnist_dataloaders,
+    SUPPORTED_DATASETS,
+    get_dataset_config,
+    get_dataset_dataloaders,
+    resolve_dataset_name,
 )
 from resmlp.model import ResMLP
 
@@ -61,9 +64,12 @@ def build_checkpoint(args, epoch, model, optimizer, eval_name, eval_loss, eval_a
         "epoch": epoch,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "dataset": args.dataset,
         "pipeline": "hybrid",
         "hidden_dim": args.hidden_dim,
         "num_layers": args.num_layers,
+        "input_dim": model.embed.in_features,
+        "num_classes": model.head.out_features,
         "eval_split": eval_name,
         "val_size": args.val_size,
         "split_seed": args.split_seed,
@@ -79,12 +85,13 @@ def build_checkpoint(args, epoch, model, optimizer, eval_name, eval_loss, eval_a
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train ResMLP on MNIST")
+    parser = argparse.ArgumentParser(description="Train ResMLP on an image dataset")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=160)
     parser.add_argument("--num-layers", type=int, default=32)
+    parser.add_argument("--dataset", choices=SUPPORTED_DATASETS, default=None)
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--val-size", type=int, default=DEFAULT_VAL_SIZE)
     parser.add_argument("--split-seed", type=int, default=DEFAULT_SPLIT_SEED)
@@ -92,30 +99,55 @@ def main():
     parser.add_argument("--save-dir", type=str, default="resmlp/checkpoints")
     args = parser.parse_args()
 
-    device = "cpu"  # MNIST is small enough for CPU training
+    device = "cpu"  # Current reference training path stays on CPU.
+
+    resume_ckpt = None
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=True)
+
+    dataset_name = resolve_dataset_name(
+        args.dataset,
+        resume_ckpt.get("dataset") if resume_ckpt else None,
+    )
+    dataset_cfg = get_dataset_config(dataset_name)
+    input_dim = resume_ckpt.get("input_dim", dataset_cfg["input_dim"]) if resume_ckpt else dataset_cfg["input_dim"]
+    num_classes = (
+        resume_ckpt.get("num_classes", dataset_cfg["num_classes"])
+        if resume_ckpt
+        else dataset_cfg["num_classes"]
+    )
+    if input_dim != dataset_cfg["input_dim"] or num_classes != dataset_cfg["num_classes"]:
+        raise ValueError(
+            f"Checkpoint/input metadata ({input_dim} inputs, {num_classes} classes) "
+            f"does not match dataset '{dataset_name}'"
+        )
+    args.dataset = dataset_name
 
     # Model
     model = ResMLP(
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
+        input_dim=input_dim,
+        num_classes=num_classes,
     ).to(device)
     print(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
-    print(f"  embed: {784} → {args.hidden_dim}")
+    print(f"  dataset: {dataset_name}")
+    print(f"  embed: {input_dim} → {args.hidden_dim}")
     print(f"  hidden: {args.num_layers} × ResidualLinear({args.hidden_dim})")
-    print(f"  head: {args.hidden_dim} → 10")
+    print(f"  head: {args.hidden_dim} → {num_classes}")
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss()
 
     start_epoch = 0
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = ckpt["epoch"] + 1
+    if resume_ckpt:
+        model.load_state_dict(resume_ckpt["model"])
+        optimizer.load_state_dict(resume_ckpt["optimizer"])
+        start_epoch = resume_ckpt["epoch"] + 1
         print(f"Resumed from epoch {start_epoch}")
 
-    train_loader, val_loader, test_loader = get_mnist_dataloaders(
+    train_loader, val_loader, test_loader = get_dataset_dataloaders(
+        dataset_name,
         args.batch_size,
         data_dir=args.data_dir,
         val_size=args.val_size,
@@ -123,7 +155,10 @@ def main():
     )
     eval_loader = val_loader if val_loader is not None else test_loader
     eval_name = "val" if val_loader is not None else "test"
-    print(f"Data split: train={len(train_loader.dataset):,}, {eval_name}={len(eval_loader.dataset):,}")
+    print(
+        f"Data split ({dataset_name}): train={len(train_loader.dataset):,}, "
+        f"{eval_name}={len(eval_loader.dataset):,}"
+    )
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)

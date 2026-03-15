@@ -1,5 +1,5 @@
 """
-Run MNIST inference on the NPU using trained ResMLP weights.
+Run dataset inference on the NPU using trained ResMLP weights.
 
 Examples:
     python -m resmlp.infer resmlp/checkpoints/resmlp_hybrid_epoch009.pt
@@ -18,18 +18,34 @@ import time
 import numpy as np
 import torch
 from ml_dtypes import bfloat16
-from torchvision import datasets, transforms
 
 from resmlp import from_tiled, to_tiled
+from resmlp.data_utils import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_VAL_SIZE,
+    SUPPORTED_DATASETS,
+    get_dataset_config,
+    get_eval_dataset,
+    resolve_dataset_name,
+)
 from resmlp.model import ResMLP
 from resmlp.op import ResMLP as NPUResMLP, ROWS_PER_COL
 
 
+def success_exit_code(observed_acc, expected_acc):
+    if expected_acc is None:
+        return 0
+    return 0 if observed_acc >= max(0.0, expected_acc - 0.10) else 1
+
+
 def main():
-    parser = argparse.ArgumentParser(description="MNIST inference on NPU")
+    parser = argparse.ArgumentParser(description="Dataset inference on NPU")
     parser.add_argument("checkpoint", help="Path to trained .pt checkpoint")
     parser.add_argument("--hidden-dim", type=int, default=None)
     parser.add_argument("--num-layers", type=int, default=None)
+    parser.add_argument("--dataset", choices=SUPPORTED_DATASETS, default=None)
+    parser.add_argument("--eval-split", choices=["val", "test"], default=None)
+    parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--num-cols", type=int, default=8)
     parser.add_argument("--bench", action="store_true", help="Show timing")
     args = parser.parse_args()
@@ -40,9 +56,20 @@ def main():
 
     print(f"Loading {args.checkpoint}...")
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    dataset_name = resolve_dataset_name(args.dataset, ckpt.get("dataset"))
+    dataset_cfg = get_dataset_config(dataset_name)
     H = args.hidden_dim if args.hidden_dim is not None else ckpt.get("hidden_dim", 160)
     num_layers = args.num_layers if args.num_layers is not None else ckpt.get("num_layers", 32)
+    input_dim = ckpt.get("input_dim", dataset_cfg["input_dim"])
+    num_classes = ckpt.get("num_classes", dataset_cfg["num_classes"])
     pipeline = ckpt.get("pipeline", "hybrid")
+    eval_split = args.eval_split or ckpt.get("eval_split", "test")
+    val_size = ckpt.get("val_size", DEFAULT_VAL_SIZE)
+    split_seed = ckpt.get("split_seed", DEFAULT_SPLIT_SEED)
+    saved_eval_acc = ckpt.get(
+        f"{eval_split}_acc",
+        ckpt.get("val_acc", ckpt.get("test_acc")),
+    )
 
     if num_layers not in {num_tiles, num_tiles - 2}:
         raise ValueError(
@@ -51,10 +78,18 @@ def main():
             "used as residual layers or with 2 identity-padded endpoints."
         )
 
-    model = ResMLP(hidden_dim=H, num_layers=num_layers)
+    model = ResMLP(
+        hidden_dim=H,
+        num_layers=num_layers,
+        input_dim=input_dim,
+        num_classes=num_classes,
+    )
     model.load_state_dict(ckpt["model"])
     model.eval()
-    print(f"  pipeline={pipeline}, epoch={ckpt['epoch']}, test acc={ckpt.get('test_acc', '?')}")
+    print(
+        f"  dataset={dataset_name}, pipeline={pipeline}, epoch={ckpt['epoch']}, "
+        f"saved {eval_split} acc={saved_eval_acc}"
+    )
 
     embed_weight = model.embed.weight.detach().float()
     embed_bias = model.embed.bias.detach().float()
@@ -76,12 +111,13 @@ def main():
 
     W_packed = np.concatenate([to_tiled(W) for W in residual_weights])
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-    ])
-    test_ds = datasets.MNIST("data", train=False, download=True,
-                             transform=transform)
+    eval_ds = get_eval_dataset(
+        dataset_name,
+        split=eval_split,
+        data_dir=args.data_dir,
+        val_size=val_size,
+        split_seed=split_seed,
+    )
 
     correct = 0
     total = 0
@@ -89,16 +125,16 @@ def main():
     cpu_time = 0.0
     zero_out = np.zeros(B * H, dtype=bfloat16)
 
-    n_batches = (len(test_ds) + B - 1) // B
-    print(f"Running inference on {len(test_ds)} images ({n_batches} batches)...")
+    n_batches = (len(eval_ds) + B - 1) // B
+    print(f"Running inference on {len(eval_ds)} {dataset_name} images ({n_batches} batches)...")
 
     for batch_idx in range(n_batches):
         start = batch_idx * B
-        end = min(start + B, len(test_ds))
+        end = min(start + B, len(eval_ds))
         actual_B = end - start
 
-        images = torch.stack([test_ds[i][0] for i in range(start, end)])
-        labels = torch.tensor([test_ds[i][1] for i in range(start, end)])
+        images = torch.stack([eval_ds[i][0] for i in range(start, end)])
+        labels = torch.tensor([eval_ds[i][1] for i in range(start, end)])
 
         if actual_B < B:
             pad = torch.zeros(B - actual_B, *images.shape[1:])
@@ -128,7 +164,7 @@ def main():
 
     accuracy = correct / total
     print(f"\n{'═' * 50}")
-    print(f"NPU accuracy: {accuracy:.4f} ({correct}/{total})")
+    print(f"NPU {eval_split} accuracy: {accuracy:.4f} ({correct}/{total})")
 
     if args.bench:
         print("\nTiming:")
@@ -138,14 +174,15 @@ def main():
 
     print("\nVerification (pure CPU):")
     with torch.no_grad():
-        sample = torch.stack([test_ds[i][0] for i in range(100)])
+        sample_count = min(100, len(eval_ds))
+        sample = torch.stack([eval_ds[i][0] for i in range(sample_count)])
         cpu_logits = model(sample)
         cpu_preds = cpu_logits.argmax(1)
-        cpu_labels = torch.tensor([test_ds[i][1] for i in range(100)])
+        cpu_labels = torch.tensor([eval_ds[i][1] for i in range(sample_count)])
         cpu_acc = (cpu_preds == cpu_labels).float().mean().item()
-    print(f"  CPU accuracy (100 samples): {cpu_acc:.4f}")
+    print(f"  CPU accuracy ({sample_count} samples): {cpu_acc:.4f}")
 
-    return 0 if accuracy > 0.90 else 1
+    return success_exit_code(accuracy, saved_eval_acc)
 
 
 if __name__ == "__main__":
