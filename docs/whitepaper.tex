@@ -805,6 +805,89 @@ to a cleaner throughput story comes from host-side fresh-context orchestration
 and missing full weight persistence, not from missing forward, backward, or SGD
 math on the array.
 
+\section{One-column simple convnet bring-up}
+
+To separate ``training math works on the array'' from the harder residual-state
+and persistence problems, the repository now also contains a deliberately small
+alternative path in \code{simplecnn/}. This design uses only one compute column
+and four trainable tiles:
+\begin{itemize}
+  \item tile 0: a $1\rightarrow4$ convolution, $3\times3$, stride 2, producing
+        $14\times14\times4$,
+  \item tile 1: a $4\rightarrow8$ convolution, $3\times3$, stride 2, producing
+        $7\times7\times8$,
+  \item tile 2: an $8\rightarrow16$ convolution, $3\times3$, stride 2,
+        producing $4\times4\times16$, followed by global average pooling,
+  \item tile 3: a linear $16\rightarrow10$ classifier with a tiny top-1 hinge
+        update.
+\end{itemize}
+
+This path started as a compile-oriented simplification, but it still needed a
+surprising amount of correctness work before the metrics meant anything. The
+generic conv training kernel overflowed tile program memory, so the final design
+uses three fixed-shape kernels (\code{conv1\_train.cc},
+\code{conv2\_train.cc}, \code{conv3\_train.cc}). More importantly, the model
+and the kernels had to agree on several non-obvious conventions:
+\begin{itemize}
+  \item conv weights are packed as \code{[out, ky, kx, in]}, not PyTorch's
+        native \code{[out, in, ky, kx]},
+  \item the pooled $8\times16$ buffer must stay row-major all the way into the
+        classifier head, not be silently reinterpreted as an $8\times8$ tiled
+        matrix,
+  \item generated MLIR / XCLBIN / instruction artifacts must fingerprint kernel
+        source changes as well as the Python design files, otherwise stale
+        binaries can survive apparently real rebuilds,
+  \item conv weight drainback needs explicit \code{wait=True}; without it, the
+        head weights drained correctly while the conv weights arrived on the host
+        as zeros.
+\end{itemize}
+
+After these fixes, one-batch NPU updates matched a bf16-quantized CPU replay of
+the same kernels closely, and the batch predictions matched exactly. That made
+the remaining limitation much clearer: the one-column convnet is now a
+parity-checked, stable full-NPU training path, but it is not yet a good MNIST
+model.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}rccrrr@{}}
+\toprule
+Epoch & Train acc & Test acc & Time (s) & Img/s & ms/call \\
+\midrule
+0 & 0.1114 & 0.1077 & 46.2 & 1298 & 5.3 \\
+1 & 0.1027 & 0.1033 & 42.3 & 1417 & 4.7 \\
+2 & 0.1031 & 0.1024 & 42.3 & 1420 & 4.7 \\
+3 & 0.1036 & 0.1023 & 42.4 & 1414 & 4.7 \\
+4 & 0.1034 & 0.1061 & 42.1 & 1425 & 4.7 \\
+5 & 0.1084 & 0.1065 & 42.4 & 1414 & 4.7 \\
+6 & 0.1084 & 0.1047 & 42.8 & 1401 & 4.7 \\
+7 & 0.1045 & 0.1023 & 42.0 & 1429 & 4.7 \\
+8 & 0.1031 & 0.1014 & 41.9 & 1433 & 4.7 \\
+9 & 0.1029 & 0.1016 & 41.5 & 1446 & 4.7 \\
+\bottomrule
+\end{tabular}
+\caption{Ten-epoch MNIST run for the current \code{simplecnn} default:
+batch size 8, one compute column, four trainable tiles, top-1 hinge head, and
+NPU SGD step $\eta=0.05$. Each epoch still launches 7,500 NPU calls because
+the current host path is batch-oriented rather than epoch-resident.}
+\label{tab:simplecnn-10epoch}
+\end{table}
+
+The result is mixed but useful. The design is now stable across 10 epochs with
+no numeric failure or runtime corruption, and the measured NPU call itself is
+small: about 4.7--5.3 ms. Throughput is also respectable for such a tiny
+pedagogical design, roughly 1.3--1.4k images/s. But the learning signal remains
+weak: the best test accuracy in this run is 10.77\% at epoch 0, and the final
+test accuracy is 10.16\% at epoch 9, which is effectively chance on MNIST.
+
+This makes the current interpretation straightforward. The one-column convnet is
+not yet a useful MNIST baseline, but it \emph{is} a useful systems baseline. It
+shows that a much simpler four-tile training graph can now be compiled,
+validated against a quantized CPU replay, and run stably for many epochs on the
+NPU. The remaining work is now about model quality and on-device residency, not
+whether the basic forward/backward/update path is functioning.
+
 \section{Compact glossary}
 
 \begin{table}[h]

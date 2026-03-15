@@ -24,6 +24,8 @@ Yes! 100% on-chip training:
    - Sends dx to Tile i-1.
 """
 
+from pathlib import Path
+
 import numpy as np
 from ml_dtypes import bfloat16
 
@@ -31,6 +33,8 @@ from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU2, Tile
 from aie.helpers.taplib.tap import TensorAccessPattern
+
+from resmlp.artifact_utils import training_kernel_archive_name
 
 ROWS_PER_COL = 4
 
@@ -44,11 +48,15 @@ def snake_tile_order(num_cols):
     return tiles
 
 
-def training_pipeline(H=160, B=8, num_cols=8):
+def training_pipeline(H=160, B=8, num_cols=8, sgd_lr=0.005):
     assert 1 <= num_cols <= 8
     assert B % 8 == 0 and H % 8 == 0
     num_tiles = num_cols * ROWS_PER_COL
     tile_order = snake_tile_order(num_cols)
+    use_split_backward = H >= 160
+    archive_name = training_kernel_archive_name(
+        Path(__file__).resolve().parent.parent, B=B, H=H, sgd_lr=sgd_lr
+    )
 
     act_ty = np.ndarray[(B * H,), np.dtype[bfloat16]]
     # Each tile holds 1 weight matrix: w
@@ -61,18 +69,28 @@ def training_pipeline(H=160, B=8, num_cols=8):
     # Kernels
     fwd_kernel = Kernel(
         "matmul_relu_skip_bf16",
-        "resmlp_training_kernels.a",
+        archive_name,
         [act_ty, wt_ty, act_ty, ckpt_ty, np.int32],
     )
     copy_kernel = Kernel(
         "copy_activation_bf16",
-        "resmlp_training_kernels.a",
+        archive_name,
         [act_ty, act_ty], 
     )
     bwd_kernel = Kernel(
         "residual_backward_and_update_bf16",
-        "resmlp_training_kernels.a",
+        archive_name,
         [ckpt_ty, wt_ty, act_ty, act_ty],
+    )
+    bwd_gx_kernel = Kernel(
+        "residual_grad_input_from_ckpt_bf16",
+        archive_name,
+        [ckpt_ty, wt_ty, act_ty, act_ty],
+    )
+    bwd_update_kernel = Kernel(
+        "residual_sgd_update_from_gz_bf16",
+        archive_name,
+        [ckpt_ty, wt_ty],
     )
 
     # Weights
@@ -116,7 +134,20 @@ def training_pipeline(H=160, B=8, num_cols=8):
         g_out_ep = grad_out.prod() if idx == 0 else grad_inter[idx - 1].prod()
 
         def make_worker(i_ep, o_ep, w_ep, gi_ep, go_ep):
-            def tile_worker(of_in, of_out, of_w, of_gin, of_gout, of_ckpt_prod, of_ckpt_cons, cp_kern, fwd_kern, bwd_kern):
+            def tile_worker(
+                of_in,
+                of_out,
+                of_w,
+                of_gin,
+                of_gout,
+                of_ckpt_prod,
+                of_ckpt_cons,
+                cp_kern,
+                fwd_kern,
+                bwd_kern,
+                bwd_gx_kern,
+                bwd_update_kern,
+            ):
                 # FORWARD PASS
                 x = of_in.acquire(1)
                 y = of_out.acquire(1)
@@ -135,8 +166,12 @@ def training_pipeline(H=160, B=8, num_cols=8):
                 gy = of_gin.acquire(1)
                 gx = of_gout.acquire(1)
                 ckpt_read = of_ckpt_cons.acquire(1)
-                
-                bwd_kern(ckpt_read, w, gy, gx)
+
+                if use_split_backward:
+                    bwd_gx_kern(ckpt_read, w, gy, gx)
+                    bwd_update_kern(ckpt_read, w)
+                else:
+                    bwd_kern(ckpt_read, w, gy, gx)
                 
                 of_gin.release(1)
                 of_gout.release(1)
@@ -147,7 +182,20 @@ def training_pipeline(H=160, B=8, num_cols=8):
             
         workers.append(Worker(
             make_worker(in_ep, out_ep, wt_cons, g_in_ep, g_out_ep),
-            [in_ep, out_ep, wt_cons, g_in_ep, g_out_ep, local_ckpt.prod(), local_ckpt.cons(), copy_kernel, fwd_kernel, bwd_kernel],
+            [
+                in_ep,
+                out_ep,
+                wt_cons,
+                g_in_ep,
+                g_out_ep,
+                local_ckpt.prod(),
+                local_ckpt.cons(),
+                copy_kernel,
+                fwd_kernel,
+                bwd_kernel,
+                bwd_gx_kernel,
+                bwd_update_kernel,
+            ],
             placement=Tile(col=col, row=row),
             stack_size=0x400,
         ))

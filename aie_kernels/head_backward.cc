@@ -18,7 +18,7 @@
 #define DIM_N_CLS 16
 #endif
 #ifndef SGD_LR
-#define SGD_LR 0.01f
+#define SGD_LR 0.005f
 #endif
 
 static inline void untile(const bfloat16 *tiled, float *row_major, int M, int K)

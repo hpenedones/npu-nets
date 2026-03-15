@@ -15,6 +15,9 @@
 #ifndef DIM_H
 #define DIM_H 32
 #endif
+#ifndef SGD_LR
+#define SGD_LR 0.005f
+#endif
 
 template <typename T>
 static inline void
@@ -31,7 +34,7 @@ extern "C" {
 
 void embed_backward_bf16(bfloat16 *x, bfloat16 *w, bfloat16 *dy)
 {
-    float lr = 0.01f;
+    float lr = SGD_LR;
 
     static_assert(DIM_M % 8 == 0);
     static_assert(DIM_K_EMBED % 8 == 0);
