@@ -1275,6 +1275,102 @@ much better one to have: not ``can depth 32 work at all?'', but ``how much more
 of the surrounding graph should move on-array, and how much closer to peak can
 this runtime contract go?''.
 
+\subsection{Literature context for HIGGS}
+
+The HIGGS dataset was introduced by Baldi, Sadowski, and Whiteson as a
+large-scale signal-versus-background benchmark for collider physics: roughly
+11~million simulated events, a binary label, and 28 floating-point input
+features, of which 21 are low-level kinematic variables and 7 are
+high-level physics features derived from them \cite{baldi-higgs,uci-higgs}.
+That origin matters for this project. Unlike CIFAR-10, HIGGS is already a dense
+vector problem, so a residual MLP is at least structurally plausible before any
+throughput arguments are made.
+
+The literature around HIGGS then splits into two overlapping traditions. In
+high-energy physics, the original result showed that deep networks trained on
+the low-level variables can outperform shallower models and reduce the need for
+manually engineered high-level features \cite{baldi-higgs}. In general tabular
+machine learning, HIGGS became one of the canonical large-data benchmarks for
+systems papers on gradient-boosted trees such as XGBoost, LightGBM, and
+CatBoost \cite{xgboost-kdd,lightgbm-nips,catboost-paper}. More recent surveys
+of tabular learning still conclude that there is no universally superior neural
+architecture and that tree ensembles remain the safest overall accuracy
+baseline, even as modern tabular deep-learning models become more competitive
+\cite{rtdl-revisiting,grinsztajn-tabular}.
+
+One useful modern reference point is the RTDL benchmark of Gorishniy et al.,
+which compares tuned deep models and tree ensembles under one protocol on the
+reduced \code{higgs\_small} variant \cite{rtdl-revisiting,rtdl-revisit-repo}. The
+published test accuracies there are tightly clustered:
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+Model & Test accuracy on \code{higgs\_small} \\
+\midrule
+FT-Transformer & 72.74\% \\
+ResNet-like MLP & 72.60\% \\
+XGBoost & 72.60\% \\
+LightGBM & 72.40\% \\
+CatBoost & 72.12\% \\
+Plain MLP & 72.09\% \\
+\bottomrule
+\end{tabular}
+\caption{Representative tuned results from the RTDL benchmark repository on
+\code{higgs\_small} \cite{rtdl-revisit-repo}.}
+\label{tab:higgs-small-rtdl}
+\end{table}
+
+Two conclusions from that literature matter for this whitepaper. First, HIGGS
+really is a serious benchmark for dense-vector models: modern neural tabular
+architectures are competitive there in a way that a plain MLP on CIFAR-10 is
+not. Second, the phrase ``state of the art on HIGGS'' has to be handled
+carefully. Rankings depend on whether a paper uses the full 11M-row dataset or
+the reduced \code{higgs\_small} variant, whether it reports accuracy, AUC, or
+physics-specific significance metrics, and how much hyperparameter search is
+allowed. For our purposes, the key point is narrower and more practical: HIGGS
+is a well-studied vector benchmark on which both boosted trees and modern
+tabular neural networks are credible baselines, which makes it a much better
+fit for the resident-snake throughput story than a spatial image task.
+
+A useful next question is whether the resident-snake points in this project
+stay in that same accuracy band once they are trained on real public data. For
+that pilot, I used the public Hugging Face mirror of the HIGGS benchmark splits
+\cite{jxie-higgs}, merged \code{train\_63k} and \code{val\_16k} into the local
+training pool, kept \code{test\_20k} fixed, and held out 15{,}688 examples
+inside the training pool for model selection. That is not byte-for-byte the
+exact RTDL protocol, but it is close enough to test the practical question that
+matters here: whether the throughput-friendly residual MLP remains a useful
+classifier once the data are real.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Model & CPU test accuracy & Streamed NPU test accuracy \\
+\midrule
+$H=32$, $L=8$ & 71.76\% & 71.81\% \\
+$H=32$, $L=32$ & 72.04\% & 72.03\% \\
+\bottomrule
+\end{tabular}
+\caption{Real HIGGS pilot on the public \code{jxie/higgs} mirror. The residual
+body runs in the streamed NPU path; the final $32 \to 2$ classifier head still
+runs on the host because the current logits kernel is fixed to the 10-class
+image path.}
+\label{tab:higgs-real-pilot}
+\end{table}
+
+Those numbers matter more than their absolute size might suggest. They show
+that the HIGGS demo is no longer just a synthetic-throughput toy: the smallest
+8-layer point, which is also the highest-throughput configuration measured so
+far, lands within about one percentage point of the strongest tuned
+\code{higgs\_small} baselines in Table~\ref{tab:higgs-small-rtdl}. Just as
+importantly, the streamed NPU body reproduces the CPU reference to within
+measurement noise, so the deployment path is numerically credible even though
+the 2-class head has not yet moved on-array.
+
 \section{Compact glossary}
 
 \begin{table}[h]
@@ -1369,6 +1465,49 @@ Y. Umuroglu et al., \emph{FINN: A Framework for Fast, Scalable Binarized Neural 
 \bibitem{airbench-cifar-training}
 K. Jordan et al., \emph{94\% on CIFAR-10 in 3.29 Seconds on a Single GPU}.\newline
 \url{https://arxiv.org/abs/2404.00498}
+
+\bibitem{baldi-higgs}
+P. Baldi, P. Sadowski, and D. Whiteson, \emph{Searching for Exotic Particles in
+High-Energy Physics with Deep Learning}.\newline
+\url{https://arxiv.org/abs/1402.4735}
+
+\bibitem{uci-higgs}
+UCI Machine Learning Repository, \emph{HIGGS dataset}.\newline
+\url{https://archive.ics.uci.edu/dataset/280/higgs}
+
+\bibitem{jxie-higgs}
+J. Xie, \emph{HIGGS} (Hugging Face dataset mirror with published benchmark
+splits).\newline
+\url{https://huggingface.co/datasets/jxie/higgs}
+
+\bibitem{xgboost-kdd}
+T. Chen and C. Guestrin, \emph{XGBoost: A Scalable Tree Boosting System}.\newline
+\url{https://arxiv.org/abs/1603.02754}
+
+\bibitem{lightgbm-nips}
+G. Ke et al., \emph{LightGBM: A Highly Efficient Gradient Boosting Decision
+Tree}.\newline
+\href{https://papers.nips.cc/paper/6907-lightgbm-a-highly-efficient-gradient-boosting-decision-tree}{papers.nips.cc/paper/6907-lightgbm}
+
+\bibitem{catboost-paper}
+L. Prokhorenkova et al., \emph{CatBoost: Unbiased Boosting with Categorical
+Features}.\newline
+\url{https://arxiv.org/abs/1706.09516}
+
+\bibitem{rtdl-revisiting}
+Y. Gorishniy, I. Rubachev, V. Khrulkov, and A. Babenko, \emph{Revisiting Deep
+Learning Models for Tabular Data}.\newline
+\url{https://arxiv.org/abs/2106.11959}
+
+\bibitem{rtdl-revisit-repo}
+Yandex Research, \emph{Revisiting Deep Learning Models for Tabular Data:
+official repository and published benchmark outputs}.\newline
+\url{https://github.com/yandex-research/tabular-dl-revisiting-models}
+
+\bibitem{grinsztajn-tabular}
+L. Grinsztajn, E. Oyallon, and G. Varoquaux, \emph{Why do tree-based models
+still outperform deep learning on tabular data?}.\newline
+\url{https://arxiv.org/abs/2207.08815}
 
 \bibitem{batch-size-gpu-tpu}
 Y. Gordienko et al., \emph{Batch Size Influence on Performance of Graphic and Tensor Processing Units During Training and Inference Phases}.\newline

@@ -96,14 +96,33 @@ def _prepare_higgs_tensors(features, labels):
     return features, labels
 
 
-def _load_higgs_tensors(data_dir="data"):
+def _load_higgs_cache(data_dir="data"):
     data_dir = Path(data_dir)
     cache_path = _find_higgs_path(data_dir, ("HIGGS.pt", "higgs.pt"))
     if cache_path is not None:
         data = torch.load(cache_path, map_location="cpu", weights_only=True)
-        if not isinstance(data, dict) or "features" not in data or "labels" not in data:
-            raise ValueError(f"Expected HIGGS tensor cache dict with features/labels at {cache_path}")
-        return _prepare_higgs_tensors(data["features"], data["labels"])
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected HIGGS tensor cache dict at {cache_path}")
+        if {"train_features", "train_labels", "test_features", "test_labels"} <= set(data):
+            train_features, train_labels = _prepare_higgs_tensors(
+                data["train_features"], data["train_labels"]
+            )
+            test_features, test_labels = _prepare_higgs_tensors(
+                data["test_features"], data["test_labels"]
+            )
+            return {
+                "train_features": train_features,
+                "train_labels": train_labels,
+                "test_features": test_features,
+                "test_labels": test_labels,
+            }
+        if "features" in data and "labels" in data:
+            features, labels = _prepare_higgs_tensors(data["features"], data["labels"])
+            return {"features": features, "labels": labels}
+        raise ValueError(
+            "Expected HIGGS tensor cache dict with either features/labels or "
+            f"train_features/train_labels/test_features/test_labels at {cache_path}"
+        )
 
     raw_path = _find_higgs_path(data_dir, ("HIGGS.csv.gz", "HIGGS.csv", "higgs.csv.gz", "higgs.csv"))
     if raw_path is None:
@@ -124,11 +143,29 @@ def _load_higgs_tensors(data_dir="data"):
     features = table[:, 1 : 1 + HIGGS_RAW_INPUT_DIM]
     features_t, labels_t = _prepare_higgs_tensors(features, labels)
     torch.save({"features": features_t, "labels": labels_t}, data_dir / "HIGGS.pt")
-    return features_t, labels_t
+    return {"features": features_t, "labels": labels_t}
 
 
 def load_higgs_datasets(data_dir="data", *, split_seed=DEFAULT_SPLIT_SEED):
-    features, labels = _load_higgs_tensors(data_dir=data_dir)
+    cache = _load_higgs_cache(data_dir=data_dir)
+    if {"train_features", "train_labels", "test_features", "test_labels"} <= set(cache):
+        train_features = cache["train_features"]
+        train_labels = cache["train_labels"]
+        test_features = cache["test_features"]
+        test_labels = cache["test_labels"]
+        if train_features.shape[0] < 2:
+            raise ValueError("HIGGS training split must contain at least 2 rows")
+        if test_features.shape[0] < 1:
+            raise ValueError("HIGGS test split must contain at least 1 row")
+
+        mean = train_features.mean(dim=0)
+        std = train_features.std(dim=0).clamp_min(1e-6)
+        train_ds = NormalizedTabularDataset(train_features, train_labels, mean=mean, std=std)
+        test_ds = NormalizedTabularDataset(test_features, test_labels, mean=mean, std=std)
+        return train_ds, test_ds
+
+    features = cache["features"]
+    labels = cache["labels"]
     total = features.shape[0]
     if total < 2:
         raise ValueError("HIGGS dataset must contain at least 2 rows")
