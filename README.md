@@ -5,7 +5,7 @@ for the AMD XDNA 2 NPU, deployed as a forward-only conveyor-belt pipeline,
 and evaluated on the HIGGS dataset where both throughput and latency matter.
 
 Older MNIST, CIFAR, convnet, and full backward-pass experiments live on the
-`experimental` branch and remain documented in `logbook.md`.
+`experimental` branch.
 
 ## What this branch keeps
 
@@ -23,6 +23,30 @@ Older MNIST, CIFAR, convnet, and full backward-pass experiments live on the
 | Best full-data manual run | `H=32, L=32`, 20-epoch schedule, **76.98%** test acc., **0.8542** ROC AUC |
 | Best validation-selected tuning result | `H=64, L=32`, **77.98%** test acc., **0.8653** ROC AUC, **0.8770** PR AUC |
 | Target hardware | AMD Ryzen AI 9 HX 370 / XDNA 2 |
+
+## Hardware and driver requirements
+
+Not every machine can run the full repository.
+
+- CPU-only data prep, evaluation, and basic training can run on any recent
+  Linux machine with a working Python environment.
+- Full-data HIGGS training is much more practical on a recent GPU. For the
+  published runs here, AMD GPU training used a ROCm-enabled PyTorch build.
+- The forward-only conveyor-belt NPU path requires AMD XDNA2 hardware on Linux,
+  together with the AMD runtime/toolchain stack.
+
+For the NPU path, assume the following prerequisites before you try to compile
+or run `resmlp.streaming_infer`:
+
+- AMD XDNA2 hardware such as Ryzen AI 300 / Strix Point class systems
+  (validated here on AMD Ryzen AI 9 HX 370)
+- Linux with the `amdxdna` / XRT stack installed and working
+- `source /opt/xilinx/xrt/setup.sh` available in your shell
+- `IRON` installed as an editable Python package
+- `mlir-aie` available in the same Python environment
+
+If you do not have that hardware/runtime stack, you can still use the HIGGS
+data-prep, CPU/GPU training, and MLflow/Optuna parts of the repo.
 
 ## Installation
 
@@ -143,4 +167,4 @@ easier to defend as a systems result, rather than just a toy benchmark.
 ## Historical material
 
 If you need the earlier MNIST, CIFAR, convnet, or full backward-pass work,
-switch to `experimental` or read `logbook.md`.
+switch to `experimental`.
