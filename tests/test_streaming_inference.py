@@ -15,7 +15,13 @@ import argparse
 import sys
 
 import numpy as np
+import pytest
 from ml_dtypes import bfloat16
+
+from resmlp.xrt_env import ensure_xrt_python_path
+
+ensure_xrt_python_path()
+pytest.importorskip("pyxrt")
 
 from iron.common.aie_context import AIEContext
 
@@ -109,6 +115,10 @@ def run_test(H=32, B=8, cols=2, stream_depth=1, scale=0.01):
             )
 
     return ok
+
+
+def test_streaming_inference_smoke():
+    assert run_test(H=32, B=8, cols=2, stream_depth=1, scale=0.01)
 
 
 def main():

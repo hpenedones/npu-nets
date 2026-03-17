@@ -1,93 +1,119 @@
 # NPU-Native Neural Networks
 
-Neural networks co-designed with the AMD XDNA 2 NPU — a 32-layer residual MLP,
-with one layer per tile across 32 NPU tiles, programmed with
-[IRON](https://github.com/amd/IRON).
+`main` is now the curated paper branch for one story: a residual MLP designed
+for the AMD XDNA 2 NPU, deployed as a forward-only conveyor-belt pipeline,
+and evaluated on the HIGGS dataset where both throughput and latency matter.
 
-## resmlp: 32-Layer Residual MLP on MNIST
+Older MNIST, CIFAR, convnet, and full backward-pass experiments live on the
+`experimental` branch and remain documented in `logbook.md`.
 
-Each NPU tile holds one weight matrix and computes `y = relu(x @ W) + x`.
-Data flows through all 32 tiles in a serpentine path. The repo now supports
-both the original hybrid trainer (CPU embed/head + NPU residual stack) and a
-full-NPU training mode that uses the 32 compute tiles as
-`embed + 30 residual + head`.
+## What this branch keeps
 
-```
-Input (784) → Linear → H=160
-  → [relu(x @ W_i) + x] × 32 tiles    ← NPU snake pipeline
-  → Linear → 10 classes
-```
+- HIGGS data preparation and normalization
+- CPU/GPU training for the residual MLP
+- MLflow + Optuna tuning for full-data HIGGS runs
+- Forward-only streaming NPU inference for the residual body
+- The whitepaper and hardware notes for the HIGGS paper path
 
-### Results
+## Headline results
 
-| Metric | Value |
-|--------|-------|
-| Parameters | 946K |
-| MNIST test accuracy | 97.2% |
-| NPU throughput | 24K images/sec |
-| NPU latency | 0.33 ms / batch of 8 |
+| Result | Value |
+| --- | --- |
+| Best throughput point | `H=32, L=8`, CPU head, about **4.18M samples/s** wall-clock |
+| Best full-data manual run | `H=32, L=32`, 20-epoch schedule, **76.98%** test acc., **0.8542** ROC AUC |
+| Best overnight sweep result | `H=64, L=32`, **77.98%** test acc., **0.8653** ROC AUC, **0.8770** PR AUC |
+| Target hardware | AMD Ryzen AI 9 HX 370 / XDNA 2 |
 
-### Quick Start
+## Quick start
+
+### 1. Prepare the full HIGGS cache
 
 ```bash
-# Train on CPU (~45 seconds)
-python -m resmlp.train
-
-# Train with the hybrid path (CPU embed/head, NPU residual stack)
-python -m resmlp.train_npu --epochs 10
-
-# Train with the full-NPU path (1 embed tile + 30 residual tiles + 1 head tile)
-# This mode currently requires all 8 columns / 32 compute tiles.
-# Note: current kernels use a fixed NPU SGD LR of 0.01.
-# Current limitation: weights stay resident on-device, so host checkpoint export
-# and CPU-side evaluation are not implemented for this mode yet.
-python -m resmlp.train_npu --pipeline full-npu --epochs 10
-
-# Run MNIST inference on NPU
-python -m resmlp.infer resmlp/checkpoints/resmlp_hybrid_epoch009.pt --bench
-
-# Test NPU pipeline correctness
-python -m tests.test_training --cols 1
-python -m tests.test_inference --cols 1
+python -m resmlp.prepare_higgs_cache \
+  --data-dir data/higgs_full \
+  --train-splits train \
+  --test-splits test
 ```
 
-## Project Structure
+This produces a split-aware `data/higgs_full/HIGGS.pt` cache from the public
+`jxie/higgs` Hugging Face mirror.
 
+### 2. Train a strong HIGGS model on GPU
+
+```bash
+python -m resmlp.train \
+  --data-dir data/higgs_full \
+  --device cuda \
+  --epochs 50 \
+  --save-dir build/higgs_h64_l32
 ```
+
+The curated defaults are already pointed at the current strong HIGGS region:
+`H=64`, `L=32`, AdamW, cosine decay, moderate label smoothing, and full-data
+validation.
+
+### 3. Launch an MLflow + Optuna sweep
+
+```bash
+python -m resmlp.tune_higgs_optuna \
+  --data-dir data/higgs_full \
+  --device cuda \
+  --study-name higgs-full-exploit \
+  --experiment-name higgs-full-optuna
+```
+
+MLflow logs go under `mlruns/` and the Optuna study state lives in
+`build/higgs_optuna.db`.
+
+### 4. Benchmark the conveyor-belt NPU path
+
+```bash
+python -m resmlp.streaming_infer build/higgs_h64_l32/resmlp_best.pt \
+  --data-dir data/higgs_full \
+  --batch-size 48 \
+  --num-cols 8 \
+  --stream-depth 32 \
+  --bench-samples 50000000
+```
+
+Use a smaller `--num-cols` value for shallower checkpoints. For the strongest
+throughput point (`H=32, L=8`) the main branch uses the residual body on NPU
+and keeps the tiny classifier head on CPU.
+
+## Repository layout
+
+```text
 resmlp/
-├── __init__.py          # Tiled layout utilities (to_tiled / from_tiled)
-├── model.py             # PyTorch model: embed → residual stack → head
-├── train.py             # CPU-only MNIST training
-├── train_npu.py         # Hybrid and full-NPU MNIST training entry points
-├── infer.py             # NPU inference with trained weights
-├── design.py            # IRON snake pipeline (inference: 32 tiles)
-├── op.py                # IRON operator wrapper (inference)
-├── training_design.py   # Hybrid training pipeline (32 residual tiles)
-├── training_op.py       # Hybrid training operator wrapper
-├── training_full_design.py # Full-NPU pipeline (embed + 30 residual + head)
-└── training_full_op.py  # Full-NPU operator wrapper
+├── model.py                # Residual MLP used for HIGGS training and inference
+├── data_utils.py           # HIGGS-only data loading and split helpers
+├── prepare_higgs_cache.py  # Public-data cache materialization
+├── train.py                # CPU/GPU training entry point
+├── tune_higgs_optuna.py    # MLflow + Optuna overnight sweeps
+├── streaming_design.py     # IRON conveyor-belt MLIR generator
+├── streaming_op.py         # XRT operator wrapper for the NPU body
+└── streaming_infer.py      # HIGGS evaluation / throughput benchmark CLI
 
 aie_kernels/
-├── matmul_relu_skip.cc  # Fused fwd kernel: c = relu(a @ w) + a
-├── residual_backward.cc # Fused bwd kernel: grad + in-place SGD update
-└── copy_activation.cc   # SRAM block copy utility
+└── matmul_relu_skip.cc     # Forward residual kernel used by the conveyor belt
 
 tests/
-├── test_inference.py    # Snake pipeline correctness + benchmark
-├── test_backward.py     # Single-layer backward validation
-├── test_checkpoint.py   # Forward checkpoint probe
-└── test_training.py     # Full training pipeline validation (fwd+bwd+SGD)
+├── test_higgs_data.py          # Native-width HIGGS data regression tests
+└── test_streaming_inference.py # Streaming residual operator correctness test
+
+docs/
+├── whitepaper.tex          # Paper-focused source
+├── whitepaper.pdf          # Built whitepaper
+└── xdna2_hardware.png      # Hardware figure used in the paper
 ```
 
-## Requirements
+## Why HIGGS?
 
-- **NPU**: AMD Ryzen AI (XDNA 2 / Strix Point) — e.g. Ryzen AI 9 HX 370
-- **OS**: Linux, kernel 6.11+ with `amdxdna` driver
-- **Toolchain**: [IRON](https://github.com/amd/IRON) /
-  [XRT](https://github.com/amd/xdna-driver)
+CIFAR-10 and MNIST were useful bring-up tasks, but HIGGS is the branch's real
+target workload: a dense tabular classification problem with a direct link to
+high-energy-physics event filtering. That makes high-throughput inference much
+easier to defend as a systems result, rather than just a toy benchmark.
 
-## References
+## Historical material
 
-- [IRON](https://github.com/amd/IRON) — close-to-metal NPU programming
-- [MLIR-AIE programming guide](https://github.com/Xilinx/mlir-aie/tree/main/programming_guide)
-- [Development logbook](logbook.md) — full history and technical notes
+If you need the earlier MNIST, CIFAR, convnet, or full backward-pass work,
+switch to `experimental` or read `logbook.md`.

@@ -1,13 +1,6 @@
-"""
-Train the residual MLP on image classification datasets.
+"""Train the residual MLP on the HIGGS dataset."""
 
-Usage:
-    python resmlp/train.py                    # train from scratch
-    python resmlp/train.py --epochs 20        # more epochs
-    python resmlp/train.py --resume ckpt.pt   # resume from checkpoint
-
-Checkpoints are saved to resmlp/checkpoints/.
-"""
+from __future__ import annotations
 
 import argparse
 import random
@@ -15,9 +8,9 @@ import sys
 import time
 from pathlib import Path
 
+import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch
 
 from resmlp.data_utils import (
     DEFAULT_SPLIT_SEED,
@@ -33,31 +26,47 @@ from resmlp.model import ResMLP
 
 def train_epoch(model, loader, optimizer, criterion, device):
     model.train()
-    total_loss, correct, total = 0, 0, 0
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    non_blocking = device == "cuda"
+
+    for features, labels in loader:
+        features = features.to(device, non_blocking=non_blocking)
+        labels = labels.to(device, non_blocking=non_blocking)
+
         optimizer.zero_grad()
-        logits = model(images)
+        logits = model(features)
         loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
+
         total_loss += loss.item() * labels.size(0)
         correct += (logits.argmax(1) == labels).sum().item()
         total += labels.size(0)
+
     return total_loss / total, correct / total
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
-    total_loss, correct, total = 0, 0, 0
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
-        logits = model(images)
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    non_blocking = device == "cuda"
+
+    for features, labels in loader:
+        features = features.to(device, non_blocking=non_blocking)
+        labels = labels.to(device, non_blocking=non_blocking)
+
+        logits = model(features)
         loss = criterion(logits, labels)
+
         total_loss += loss.item() * labels.size(0)
         correct += (logits.argmax(1) == labels).sum().item()
         total += labels.size(0)
+
     return total_loss / total, correct / total
 
 
@@ -128,14 +137,14 @@ def build_checkpoint(args, epoch, model, optimizer, scheduler, eval_name, eval_l
         "val_size": args.val_size,
         "split_seed": args.split_seed,
         "seed": args.seed,
-        "train_aug": args.train_aug,
+        "train_aug": getattr(args, "train_aug", "none"),
         "optimizer_name": args.optimizer,
         "weight_decay": args.weight_decay,
         "label_smoothing": args.label_smoothing,
         "scheduler_name": args.scheduler,
         "momentum": args.momentum,
         "min_lr": args.min_lr,
-        "npu_batch_size": args.batch_size,
+        "npu_batch_size": getattr(args, "npu_batch_size", getattr(args, "batch_size", None)),
     }
     if eval_name == "val":
         checkpoint["val_loss"] = eval_loss
@@ -146,33 +155,38 @@ def build_checkpoint(args, epoch, model, optimizer, scheduler, eval_name, eval_l
     return checkpoint
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train ResMLP on an image dataset")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--min-lr", type=float, default=0.0)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--hidden-dim", type=int, default=160)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Train the residual MLP on HIGGS")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=1.0e-3)
+    parser.add_argument("--min-lr", type=float, default=8.0e-5)
+    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--num-layers", type=int, default=32)
     parser.add_argument("--residual-bias", action="store_true")
-    parser.add_argument("--dataset", choices=SUPPORTED_DATASETS, default=None)
-    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--dataset", choices=SUPPORTED_DATASETS, default="higgs")
+    parser.add_argument("--data-dir", type=str, default="data/higgs_full")
     parser.add_argument("--val-size", type=int, default=DEFAULT_VAL_SIZE)
     parser.add_argument("--split-seed", type=int, default=DEFAULT_SPLIT_SEED)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--optimizer", choices=("adam", "adamw", "sgd"), default="adam")
-    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--optimizer", choices=("adam", "adamw", "sgd"), default="adamw")
+    parser.add_argument("--weight-decay", type=float, default=3.0e-3)
     parser.add_argument("--momentum", type=float, default=0.9)
-    parser.add_argument("--label-smoothing", type=float, default=0.0)
-    parser.add_argument("--scheduler", choices=("none", "cosine"), default="none")
+    parser.add_argument("--label-smoothing", type=float, default=0.02)
+    parser.add_argument("--scheduler", choices=("none", "cosine"), default="cosine")
     parser.add_argument("--train-aug", choices=SUPPORTED_TRAIN_AUGS, default="none")
-    parser.add_argument("--train-num-workers", type=int, default=2)
+    parser.add_argument("--train-num-workers", type=int, default=4)
     parser.add_argument("--eval-num-workers", type=int, default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--resume-mode", choices=("full", "weights_only"), default="full")
-    parser.add_argument("--save-dir", type=str, default="resmlp/checkpoints")
-    args = parser.parse_args()
+    parser.add_argument("--save-dir", type=str, default="build/higgs_checkpoints")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    args.npu_batch_size = args.batch_size
 
     set_seed(args.seed)
     device = resolve_device(args.device)
@@ -194,6 +208,9 @@ def main():
         if resume_ckpt
         else dataset_cfg["num_classes"]
     )
+    if resume_ckpt:
+        args.hidden_dim = resume_ckpt.get("hidden_dim", args.hidden_dim)
+        args.num_layers = resume_ckpt.get("num_layers", args.num_layers)
     ckpt_residual_bias = bool(resume_ckpt.get("residual_bias", False)) if resume_ckpt else False
     if resume_ckpt and args.residual_bias and not ckpt_residual_bias:
         raise ValueError(
@@ -208,7 +225,6 @@ def main():
         )
     args.dataset = dataset_name
 
-    # Model
     model = ResMLP(
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
@@ -219,14 +235,13 @@ def main():
     print(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
     print(f"  device: {device}")
     print(f"  dataset: {dataset_name}")
-    print(f"  embed: {input_dim} → {args.hidden_dim}")
-    print(f"  hidden: {args.num_layers} × ResidualLinear({args.hidden_dim})")
-    print(f"  head: {args.hidden_dim} → {num_classes}")
+    print(f"  embed: {input_dim} -> {args.hidden_dim}")
+    print(f"  hidden: {args.num_layers} x ResidualLinear({args.hidden_dim})")
+    print(f"  head: {args.hidden_dim} -> {num_classes}")
     print(f"  residual_bias: {args.residual_bias}")
     print(f"  optimizer: {args.optimizer} lr={args.lr:g} wd={args.weight_decay:g}")
     print(f"  scheduler: {args.scheduler} min_lr={args.min_lr:g}")
     print(f"  label_smoothing: {args.label_smoothing:g}")
-    print(f"  train_aug: {args.train_aug}")
 
     optimizer = build_optimizer(args, model.parameters())
     scheduler = build_scheduler(args, optimizer)
@@ -258,48 +273,41 @@ def main():
     )
     eval_loader = val_loader if val_loader is not None else test_loader
     eval_name = "val" if val_loader is not None else "test"
-    print(
-        f"Data split ({dataset_name}): train={len(train_loader.dataset):,}, "
-        f"{eval_name}={len(eval_loader.dataset):,}"
-    )
+    print(f"Data split ({dataset_name}): train={len(train_loader.dataset):,}, {eval_name}={len(eval_loader.dataset):,}")
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     best_eval_acc = float("-inf")
+    if resume_ckpt and args.resume_mode == "full" and resume_ckpt.get("eval_split") == eval_name:
+        best_eval_acc = resume_ckpt.get(f"{eval_name}_acc", float("-inf"))
     best_path = save_dir / "resmlp_best.pt"
 
-    # Train
     print(f"\nTraining for {args.epochs} epochs...")
     for epoch in range(start_epoch, start_epoch + args.epochs):
         t0 = time.time()
         epoch_lr = optimizer.param_groups[0]["lr"]
-        train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device
-        )
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
         eval_loss, eval_acc = evaluate(model, eval_loader, criterion, device)
         elapsed = time.time() - t0
         if scheduler is not None:
             scheduler.step()
 
-        print(f"  Epoch {epoch:3d}: "
-               f"train loss={train_loss:.4f} acc={train_acc:.4f} | "
-               f"{eval_name} loss={eval_loss:.4f} acc={eval_acc:.4f} | "
-               f"lr={epoch_lr:.3e} | "
-               f"{elapsed:.1f}s")
-
-        checkpoint = build_checkpoint(
-            args, epoch, model, optimizer, scheduler, eval_name, eval_loss, eval_acc
+        print(
+            f"  Epoch {epoch:3d}: train loss={train_loss:.4f} acc={train_acc:.4f} | "
+            f"{eval_name} loss={eval_loss:.4f} acc={eval_acc:.4f} | "
+            f"lr={epoch_lr:.3e} | {elapsed:.1f}s"
         )
+
+        checkpoint = build_checkpoint(args, epoch, model, optimizer, scheduler, eval_name, eval_loss, eval_acc)
         if eval_acc > best_eval_acc:
             best_eval_acc = eval_acc
             torch.save(checkpoint, best_path)
-            print(f"    → saved {best_path} (best {eval_name})")
+            print(f"    -> saved {best_path} (best {eval_name})")
 
-        # Save checkpoint every 5 epochs and at the end
         if (epoch + 1) % 5 == 0 or epoch == start_epoch + args.epochs - 1:
             path = save_dir / f"resmlp_epoch{epoch:03d}.pt"
             torch.save(checkpoint, path)
-            print(f"    → saved {path}")
+            print(f"    -> saved {path}")
 
     print(f"\nFinal {eval_name} accuracy: {eval_acc:.4f}")
     return 0

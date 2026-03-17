@@ -9,11 +9,8 @@
 \usepackage{tabularx}
 \usepackage{array}
 \usepackage{enumitem}
-\usepackage{hyperref}
 \usepackage{xcolor}
-\usepackage{listings}
-\usepackage{tikz}
-\usetikzlibrary{arrows.meta,positioning,fit,calc}
+\usepackage{hyperref}
 \hypersetup{
   colorlinks=true,
   linkcolor=blue!60!black,
@@ -23,21 +20,9 @@
   pdfauthor={npu-nets project}
 }
 \setlist{nosep}
-\lstset{
-  basicstyle=\ttfamily\small,
-  breaklines=true,
-  columns=fullflexible,
-  frame=single,
-  rulecolor=\color{black!20},
-  backgroundcolor=\color{black!2}
-}
 
 \newcommand{\code}[1]{\texttt{#1}}
 \newcommand{\repo}{\texttt{npu-nets}}
-\newcommand{\Hidden}{160}
-\newcommand{\Batch}{8}
-\newcommand{\Layers}{32}
-\newcommand{\Tiles}{32}
 
 \title{NPU-Native Neural Networks on AMD XDNA~2}
 \author{Built with \href{https://github.com/amd/IRON}{IRON/MLIR-AIE} --- target device: AMD Ryzen AI 9 HX 370 (Strix Point)}
@@ -47,1357 +32,203 @@
 \maketitle
 
 \begin{center}
-\large Hardware-software co-design for close-to-metal neural network inference
+\large A curated paper branch for conveyor-belt residual inference on HIGGS
 \end{center}
 
 \begin{abstract}
-This document is a compact tutorial and research note about co-designing a neural
-network for the AMD XDNA~2 NPU. The working example is deliberately simple: a
-32-layer residual MLP, first mapped to MNIST and then retargeted to CIFAR-10,
-with one learnable weight matrix per compute tile and activations flowing
-through the full 32-tile array in a snake. The point is not that these tiny
-vision tasks are intrinsically hard, nor that the current design reaches the
-hardware's peak throughput --- it does not. The point is that it is small
-enough to understand end to end, yet rich enough to expose the real constraints
-that matter on this hardware: local SRAM, MMUL-friendly data layouts, explicit
-FIFOs, and the cost of host--device orchestration.
+This whitepaper studies one deliberately narrow question: what neural-network
+shape matches the AMD XDNA~2 NPU when the goal is high-throughput,
+low-latency inference on dense collider-style features? The answer in the
+curated \code{main} branch is a forward-only residual MLP whose hidden body is
+laid out as a conveyor belt across the 32 compute tiles of the Strix Point
+array. Using the public HIGGS benchmark, the repository now reports two honest
+operating points: a throughput-oriented $H=32$, $L=8$ configuration that
+sustains about 4.18M samples/s wall-clock with the tiny classifier head left on
+CPU, and a full-data $H=64$, $L=32$ model trained on 10.4M examples that
+reaches 77.98\% test accuracy, 0.865 ROC AUC, and 0.877 PR AUC on the fixed
+500k-example test split. The point is not that this already wins every accuracy
+leaderboard; it is that the design is small enough to understand end to end,
+yet strong enough to make a credible systems case for dense event filtering on
+cheap consumer hardware.
 \end{abstract}
 
 \section{Introduction}
 
-Modern NPUs are most interesting when they stop looking like ``small GPUs'' and
-start looking like what they are: spatial dataflow machines. On AMD XDNA~2, the
-programmer sees a 2D array of compute tiles, each with local SRAM, a VLIW + SIMD
-core, a matrix-multiply unit, and explicit data-movement primitives. That makes
-this hardware unusually transparent. It also means that a model that looks
-natural in PyTorch may look awkward once you try to map it directly onto the
-array.
+Modern NPUs become most interesting when they stop being treated as ``small
+GPUs'' and are programmed as what they really are: spatial dataflow machines.
+On AMD XDNA~2, the programmer sees a 2D array of compute tiles, each with local
+SRAM, a VLIW plus SIMD core, a matrix-multiply unit, and explicit routing.
+That changes the network-design problem. The central question is no longer just
+``what architecture is accurate?'', but also ``what architecture maps cleanly to
+many tiny memories connected by explicit streams?''.
 
-This repository takes the hardware seriously. Instead of beginning with a large
-model and then asking how to squeeze it onto the device, we begin with the tile
-array and ask: what is the cleanest learnable network that maps onto it almost
-literally? The answer in the current main branch is a 32-layer residual MLP
-with one residual weight matrix per tile:
-\[
-  h_{\ell+1} = \mathrm{ReLU}(h_{\ell} W_{\ell}) + h_{\ell}, \qquad \ell=0,\dots,31.
-\]
-Each of the 32 compute tiles stores exactly one residual weight matrix. In the
-main public MNIST $H=160$ split, the host CPU still runs the input embedding,
-while the NPU runs all 32 hidden layers and the final classification head in
-one streamed service. The same residual template can then be retargeted to
-CIFAR-10 by widening the host-side input projection and moving to a narrower,
-higher-batch throughput point.
+This repository now answers that question with a single main-branch story. The
+kept path is a residual MLP for HIGGS, with one residual matrix per tile and a
+forward-only conveyor-belt deployment on the NPU. Older MNIST, CIFAR, convnet,
+and on-array backward-pass work has been moved out of the paper narrative and
+preserved only in \code{logbook.md} and on the \code{experimental} branch.
 
-The result is now a family of didactic but fully working examples:
-\begin{itemize}
-  \item the main $H=160$ end-to-end path reaches about 488{,}597 images/s,
-        or roughly $3.5\times$ over pure CPU inference on the same host,
-  \item the resident $H=160$, $B=8$ residual body reaches about 1.46 million
-        images/s wall-clock at \code{stream\_depth=32}, or about 2.39 TFLOPS,
-  \item a narrower throughput-oriented $H=96$, $B=56$ variant reaches about
-        97.3\% validation accuracy on a 50k/10k train/validation split, about
-        739k images/s wall-clock in the current host-visible service, and about
-        3.88 million images/s if only NPU kernel wait time is counted,
-  \item a throughput-tuned CIFAR-10 $H=32$, $B=176$, \code{stream\_depth=64}
-        variant sustains about 747{,}851 images/s wall-clock over a 100M-image
-        run and about 3.06 million images/s if only NPU kernel wait time is
-        counted, with the CPU-side $3072\rightarrow32$ embed now dominating the
-        total wall time.
-\end{itemize}
-
-These numbers are intentionally modest relative to the NPU's peak. The current
-paper is therefore not a claim that this is the fastest possible use of XDNA~2.
-It is a clear case study in co-design: how the shape of a network changes once
-local memory, tiling, and routing become first-class design constraints. Older,
-more experimental iterations of the project are preserved in \code{logbook.md}
-and on the \code{experimental} branch; this whitepaper focuses only on the
-current \code{resmlp/} implementation.
+HIGGS is the right benchmark for this branch. It is a dense 28-feature binary
+classification task derived from collider events, introduced by Baldi,
+Sadowski, and Whiteson as a large-scale signal-versus-background benchmark with
+roughly 11 million examples \cite{baldi-higgs,uci-higgs}. That makes a residual
+MLP structurally plausible before any hardware argument is made. It also makes
+the throughput story easier to defend. For example, the CMS Phase-2 Level-1
+trigger must inspect detector data at the 40~MHz bunch-crossing rate, produce
+decisions with a latency budget of about 12.5~$\mu$s, and emit accepted events
+at roughly 750~kHz \cite{cms-phase2-l1}. This project is not a production
+trigger design, but it does live in the same systems regime: dense features,
+strict latency sensitivity, and strong pressure for very high sustained
+throughput.
 
 \section{The hardware model we program against}
 
-\subsection{Why spatial dataflow changes the design problem}
-
-A CPU or GPU programmer usually thinks in terms of a few large kernels operating
-against a shared memory system. XDNA~2 rewards a different mental model: keep
-small state local to each tile, move only what must move, and make the routing
-pattern of the computation explicit.
-
-\begin{table}[t]
-\centering
-\small
-\begin{tabularx}{\textwidth}{@{}>{\bfseries}p{0.22\textwidth}XX@{}}
-\toprule
-Mental model & CPU / GPU intuition & XDNA~2 intuition \\
-\midrule
-Compute & A few large kernels over shared memory & Many small tile-local kernels connected by explicit streams \\
-State & Parameters and activations live in DRAM / cache / HBM & Parameters should fit in tile SRAM whenever possible \\
-Data movement & Often implicit (cache hierarchy, kernel launch runtime) & Explicit (DMA, ObjectFIFOs, placement, routing) \\
-Architecture choice & Mostly driven by model quality & Driven by both model quality and physical layout \\
-\bottomrule
-\end{tabularx}
-\caption{The whitepaper assumes the reader is comfortable with neural networks, but new to spatial dataflow hardware. The central shift is from ``launch bigger kernels'' to ``shape the network so each tile has a clean local job.''}
-\label{tab:cpu-vs-npu}
-\end{table}
-
-For this reason, the first design question in this project is not ``what is the
-best architecture for MNIST?'' but rather ``what architecture maps cleanly onto a
-32-tile array with \textasciitilde{}64 KB of SRAM per tile?'' That shift is
-what makes the project interesting.
-
-\subsection{XDNA~2 at a glance}
-
-Figure~\ref{fig:xdna-layout} shows the physical layout we target. The Ryzen AI 9
-HX 370 exposes 32 compute tiles arranged as 8 columns by 4 compute rows. Below
-them sit 8 MemTiles, and below those 8 shim tiles that connect the array to
-host-visible memory and runtime control. The main branch of this repository uses
-all 32 compute tiles.
+Figure~\ref{fig:xdna-layout} shows the physical layout targeted here. The Ryzen
+AI 9 HX 370 exposes 32 compute tiles arranged as 8 columns by 4 compute rows.
+Below them sit 8 MemTiles, and below those 8 shim tiles that connect the array
+to host-visible memory and runtime control. The curated main branch keeps only
+the forward residual-inference path built on top of this full array.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=0.92\textwidth]{xdna2_hardware.png}
-\caption{Physical layout of the AMD XDNA~2 NPU used here. The project uses all
-32 compute tiles (8 columns $\times$ 4 rows). MemTiles provide additional
-on-chip memory and routing support; shim tiles connect the array to host memory
-and runtime control.}
+\caption{Physical layout of the AMD XDNA~2 NPU used here. The paper branch
+keeps a forward residual pipeline that can use up to all 32 compute tiles (8
+columns $\times$ 4 rows).}
 \label{fig:xdna-layout}
 \end{figure}
 
 \begin{table}[t]
 \centering
 \small
-\begin{tabularx}{0.9\textwidth}{@{}lX@{}}
+\begin{tabularx}{0.92\textwidth}{@{}lX@{}}
 \toprule
-Property & Value \\
+Property & Why it matters here \\
 \midrule
-Compute array & 32 compute tiles = 8 columns $\times$ 4 compute rows \\
-Per compute tile & \textasciitilde{}64 KB local data memory + tile-local program memory \\
-MemTile row & 8 memory tiles, 512 KB each \\
-Compute primitives & VLIW + SIMD core and bf16/BFP16-friendly MMUL instructions \\
-Peak headline numbers & \textasciitilde{}25 TFLOPS (bf16), 50 TOPS (int8) \cite{amd-aie,amd-xdna-wiki} \\
-Software stack & IRON / MLIR-AIE / XRT \cite{iron,mlir-aie,amd-npu-linux} \\
+32 compute tiles (8 columns $\times$ 4 rows) & Depth maps naturally to tile count; an $L=8$ body uses 2 columns, an $L=32$ body uses the full array. \\
+About 64 KB local SRAM per compute tile & Parameters must stay small enough to live locally; that strongly constrains hidden width. \\
+8$\times$8 MMUL-friendly blocked execution & Widths and batch sizes should be divisible by 8, and host-side packing must respect tiled layouts. \\
+Explicit FIFOs, DMA, and routing & Data movement is part of the design, not an afterthought hidden behind a cache hierarchy. \\
+IRON / MLIR-AIE / XRT software stack & The repository programs the array close to the hardware model rather than through a high-level opaque runtime. \\
 \bottomrule
 \end{tabularx}
-\caption{Only a few hardware facts matter for this paper. The important one is not the marketing TOPS number, but the very small per-tile SRAM budget.}
-\label{tab:xdna-properties}
+\caption{Only a few hardware facts matter for the paper branch. The most
+important is not the marketing TOPS number, but the combination of tiny tile
+memories and explicit data movement.}
+\label{tab:hardware-constraints}
 \end{table}
 
-\subsection{One compute tile, from a programmer's point of view}
+These constraints shape the model directly. The hidden body is kept square so
+that each tile stores one $H \times H$ residual weight matrix. Widths are kept
+as multiples of 8 to match the AIE MMUL datapath. The host only moves the data
+that are still cheaper to keep on CPU today: the input embed and, for the best
+current throughput point, the tiny final $H \rightarrow 2$ classifier head.
 
-Figure~\ref{fig:tile-view} is a logical view of one compute tile. It is not a
-physical floorplan. It is the subset of the architecture that matters when
-writing code with IRON and MLIR-AIE.
+\section{A residual network that matches the array}
 
-\begin{figure}[t]
-\centering
-\resizebox{0.96\textwidth}{!}{%
-\begin{tikzpicture}[
-  font=\small,
-  >={Latex[length=2.2mm]},
-  box/.style={draw, rounded corners=1.5pt, fill=blue!4},
-  innerbox/.style={draw, rounded corners=1.5pt, fill=white},
-  flow/.style={->, thick}
-]
-  \draw[box, line width=0.7pt] (0,0) rectangle (14,8.8);
-  \node[font=\bfseries] at (7,8.45) {AIE compute tile (logical view)};
+The main-branch network is intentionally minimal:
+\[
+  h_{\ell+1} = \mathrm{ReLU}(h_{\ell} W_{\ell}) + h_{\ell},
+  \qquad \ell = 0,\dots,L-1.
+\]
+Each residual matrix $W_{\ell}$ is assigned to one compute tile. Activations
+enter the array, flow through the tiles in a snake, and return to the host only
+after the full hidden body has completed. In the curated deployment path:
+\begin{itemize}
+  \item the host CPU runs the input projection from the native 28 HIGGS features
+        to hidden width $H$,
+  \item the NPU runs the residual body,
+  \item the host CPU currently keeps the tiny final $H \rightarrow 2$ head when
+        that is faster than the available fused on-array tail.
+\end{itemize}
 
-  \draw[box] (0.7,5.1) rectangle (13.3,8.0);
-  \node[anchor=west, font=\bfseries] at (0.9,7.7) {Tile-local compute};
-  \draw[innerbox] (1.1,6.2) rectangle (4.4,7.3);
-  \draw[innerbox] (4.8,6.2) rectangle (8.1,7.3);
-  \draw[innerbox] (8.5,6.2) rectangle (12.9,7.3);
-  \node[align=center] at (2.75,6.75) {Scalar\\control};
-  \node[align=center] at (6.45,6.75) {Vector SIMD\\(256-bit)};
-  \node[align=center] at (10.7,6.75) {MMUL\\8$\times$8$\times$8\\(BFP16 mode)};
-  \draw[innerbox] (1.1,5.35) rectangle (12.9,5.95);
-  \node at (7.0,5.65) {Register file + MMUL accumulators};
-  \draw[innerbox] (10.2,7.45) rectangle (13.05,7.9);
-  \node[font=\scriptsize, align=center] at (11.62,7.67) {Instruction\\memory};
+This design leads to two practical operating points.
+\begin{itemize}
+  \item \textbf{Throughput point:} $H=32$, $L=8$, mapped to 2 columns. This is
+        the fastest end-to-end HIGGS point measured so far.
+  \item \textbf{Accuracy point:} $H=64$, $L=32$, trained on the full public
+        dataset and mapped to the full 8-column array when the deeper body is
+        streamed on the NPU.
+\end{itemize}
 
-  \draw[box] (0.7,2.0) rectangle (13.3,4.7);
-  \node[anchor=west, font=\bfseries] at (0.9,4.45) {Local data SRAM (\textasciitilde{}64 KB)};
-  \draw[innerbox] (1.1,2.35) rectangle (6.2,4.0);
-  \draw[innerbox] (6.5,2.35) rectangle (9.6,4.0);
-  \draw[innerbox] (9.9,2.35) rectangle (12.9,4.0);
-  \node[align=center] at (3.65,3.18) {Weight buffer\\$W[H\times H]$};
-  \node[align=center] at (8.05,3.18) {Input buffer\\$A[B\times H]$};
-  \node[align=center] at (11.4,3.18) {Output buffer\\$C[B\times H]$};
+The important design choice is not just ``use an MLP'', but ``use an MLP whose
+depth and width map almost literally to the array''. That is what keeps the
+paper branch small, teachable, and reproducible.
 
-  \draw[box] (0.7,0.5) rectangle (13.3,1.65);
-  \node at (7.0,1.05) {DMA engine + ObjectFIFO buffer descriptors};
+\section{From Python model to NPU artifact}
 
-  \draw[flow] (7.0,5.1) -- (7.0,4.7);
-  \node[font=\scriptsize, anchor=west] at (7.1,4.9) {load/store};
-  \draw[flow] (7.0,2.0) -- (7.0,1.65);
-  \node[font=\scriptsize, anchor=west] at (7.1,1.82) {DMA transfers};
-
-  \draw[flow] (0.7,1.08) -- (-0.55,1.08);
-  \node[font=\scriptsize, anchor=east, align=right] at (-0.62,1.08) {from prev.\\tile};
-  \draw[flow] (13.3,1.08) -- (14.55,1.08);
-  \node[font=\scriptsize, anchor=west, align=left] at (14.62,1.08) {to next\\tile};
-\end{tikzpicture}}
-\caption{Logical view of one XDNA~2 compute tile: local SRAM, MMUL-backed compute, and explicit DMA / FIFO data movement.}
-\label{fig:tile-view}
-\end{figure}
-
-Three remarks are worth keeping in mind.
+The kept toolchain is deliberately short.
 \begin{enumerate}
-  \item The most valuable resource is not peak arithmetic throughput; it is the
-        ability to keep parameters local in SRAM.
-  \item The MMUL datapath likes blocked 8$\times$8 layouts, which is why this
-        project insists on dimensions divisible by 8 and uses explicit tiling on
-        the host side.
-  \item Data movement is explicit. Activations do not ``just appear'' on the next
-        tile. They move because FIFOs and DMA descriptors were created for them.
+  \item \code{aie\_kernels/matmul\_relu\_skip.cc} defines the tile-local
+        residual kernel.
+  \item \code{resmlp/streaming\_design.py} generates the conveyor-belt MLIR-AIE
+        program for a chosen $(H, B, L)$ shape.
+  \item \code{resmlp/streaming\_op.py} wraps the compiled XCLBIN and instruction
+        binary as a resident XRT operator.
+  \item \code{resmlp/streaming\_infer.py} evaluates trained checkpoints and runs
+        the repeated-sample throughput benchmark used in this paper.
 \end{enumerate}
 
-\subsection{The constraints that actually shape the design}
+A key detail of the current forward path is that the residual weights are
+embedded at compile time. In other words, each checkpoint-specific throughput
+run builds a checkpoint-specific streaming artifact. That is not the most
+general deployment contract, but it is the cleanest way to study the geometry,
+routing, and wall-clock behavior of a resident conveyor-belt design.
 
-The current \code{resmlp/} implementation is driven by a short list of very
-practical constraints, shown in Table~\ref{tab:constraints}.
+\section{Training protocol on HIGGS}
+
+The dataset path kept on \code{main} uses the public \code{jxie/higgs} mirror of
+the published train/test splits \cite{jxie-higgs}. The local cache materializer
+produces a fixed 10.5M-example train split and a fixed 500k-example test split.
+For model selection, training holds out 100k examples from the train split,
+leaving 10.4M examples for optimization. All reported runs use the native
+28-dimensional feature vector without the older padded-width legacy path.
+
+HIGGS is also a good benchmark because it sits at the intersection of two real
+literatures. In high-energy physics it is a canonical dense-event benchmark
+\cite{baldi-higgs}. In tabular machine learning it is one of the standard
+large-data problems on which tree ensembles such as XGBoost, LightGBM, and
+CatBoost remain strong baselines, while modern deep tabular models are now more
+competitive but not universally dominant \cite{xgboost-kdd,lightgbm-nips,catboost-paper,rtdl-revisiting,grinsztajn-tabular}.
+That means good-enough accuracy on HIGGS is genuinely worth caring about, even
+if the main contribution of this repository is still systems-oriented.
 
 \begin{table}[t]
-\centering
-\small
-\begin{tabularx}{\textwidth}{@{}>{\bfseries}p{0.25\textwidth}XX@{}}
-\toprule
-Constraint & Why it matters & Choice in this project \\
-\midrule
-\textasciitilde{}64 KB per tile & Weight matrix, activations, and scratch space must fit locally & Choose $H=160$: 50 KB weights + 5 KB activations + headroom \\
-8$\times$8 MMUL-friendly layout & Host tensors must be packed in blocked layout; dimensions should be multiples of 8 & Choose $B=8$ and $H=160$; use \code{to\_tiled()} / \code{from\_tiled()} \\
-Explicit routing & Every inter-tile handoff has to be representable as a FIFO / route & Use a single snake of plain \code{ObjectFifo}s across all 32 tiles \\
-Invocation overhead & Small calls waste hardware; fixed overhead dominates when the batch is tiny & Accept this for clarity; frame \code{B=8} as pedagogical, not peak-throughput \\
-Current runtime semantics & Finite XRT calls still shape the schedule, but inference no longer needs per-call weight DMA & Use checkpoint-specific inference XCLBINs with embedded tile-local weights and repeated shim DMA boundary tasks; validated deep streaming up to \code{stream\_depth=32} on the full $H=160$ path \\
-\bottomrule
-\end{tabularx}
-\caption{This is the minimal constraint set needed to understand the rest of the document. Anything else belongs in an appendix, the code, or the logbook.}
-\label{tab:constraints}
-\end{table}
-
-\section{A network that matches the array}
-
-\subsection{Model overview}
-
-The current model is intentionally plain. In the main $H=160$ streaming path,
-the CPU flattens a 28$\times$28 MNIST image and projects it to a
-160-dimensional hidden state. On the NPU, we apply 32 copies of the same layer
-shape, each with its own weights, and the final tile also projects the last
-hidden state to ten logits. Later subsections revisit the same 32-layer
-template at narrower, higher-batch operating points for both MNIST
-($H=96$, $B=56$) and CIFAR-10 ($3072\rightarrow32$, $B=176$,
-\code{stream\_depth=64}).
-
-\begin{figure}[t]
-\centering
-\resizebox{0.95\textwidth}{!}{%
-\begin{tikzpicture}[
-  font=\small,
-  node distance=6mm,
-  box/.style={draw, rounded corners=2pt, minimum height=10mm, minimum width=22mm, align=center, fill=blue!4},
-  cpu/.style={box, fill=gray!10},
-  npu/.style={box, fill=blue!8},
-  arrow/.style={-{Latex[length=2.4mm]}, thick}
-]
-  \node[cpu] (input) {MNIST image\\$784$ values};
-  \node[cpu, right=10mm of input] (embed) {CPU embed\\$784 \rightarrow \Hidden$};
-  \node[npu, right=10mm of embed, minimum width=42mm] (snake) {NPU snake\\32 residual layers\\$\mathrm{ReLU}(xW)+x$};
-  \node[npu, right=10mm of snake] (head) {NPU head\\$\Hidden \rightarrow 10$};
-  \node[cpu, right=10mm of head] (out) {class logits};
-
-  \draw[arrow] (input) -- (embed);
-  \draw[arrow] (embed) -- (snake);
-  \draw[arrow] (snake) -- (head);
-  \draw[arrow] (head) -- (out);
-\end{tikzpicture}}
-\caption{Host/NPU split in the main $H=160$ streaming path: CPU embedding, 32 NPU residual layers, then an NPU classification head on the final tile.}
-\label{fig:model-overview}
-\end{figure}
-
-For the main $H=160$ streaming path, this split is not arbitrary. The embedding
-stays on the CPU because a one-tile resident $784\rightarrow160$ projection is
-not SRAM-feasible, while the hidden stack and the small $160\rightarrow10$ head
-fit comfortably on-array. The hidden stack is the repetitive part: it is where
-a tile array is easiest to use well, because the same buffer shape recurs 32
-times.
-
-The PyTorch model in \code{resmlp/model.py} is therefore almost identical to the
-hardware view:
-\begin{lstlisting}[language=Python]
-class ResidualLinear(nn.Module):
-    def forward(self, x):
-        return torch.relu(x @ self.weight) + x
-
-class ResMLP(nn.Module):
-    def forward(self, x):
-        x = x.view(x.size(0), -1)
-        x = self.embed(x)
-        for layer in self.layers:
-            x = layer(x)
-        return self.head(x)
-\end{lstlisting}
-
-That symmetry matters. The main reason this whitepaper is easy to write at all is
-that the conceptual model and the deployed model are so close to one another.
-
-\subsection{Snake routing through all 32 tiles}
-
-The compute tiles are not used as eight independent columns in the current main
-branch. Instead, they are chained into one long serpentine path. The activation
-enters the first tile, flows through all 32 layers, and leaves the last tile.
-This is the cleanest way to make ``one weight matrix per tile'' literally true.
-
-\begin{figure}[t]
-\centering
-\resizebox{0.98\textwidth}{!}{%
-\begin{tikzpicture}[
-  every node/.style={font=\scriptsize},
-  tile/.style={draw, rounded corners=2pt, minimum width=10mm, minimum height=8mm, fill=blue!7},
-  path/.style={-{Latex[length=2.2mm]}, very thick, draw=blue!65!black}
-]
-  % Nodes
-  \foreach \c/\x in {0/0,1/1.5,2/3,3/4.5,4/6,5/7.5,6/9,7/10.5} {
-    \node[font=\bfseries] at (\x,4.0) {col \c};
-  }
-
-  % Top row (row 5)
-  \node[tile] (c0r5) at (0,3) {T3};
-  \node[tile] (c1r5) at (1.5,3) {T4};
-  \node[tile] (c2r5) at (3,3) {T11};
-  \node[tile] (c3r5) at (4.5,3) {T12};
-  \node[tile] (c4r5) at (6,3) {T19};
-  \node[tile] (c5r5) at (7.5,3) {T20};
-  \node[tile] (c6r5) at (9,3) {T27};
-  \node[tile] (c7r5) at (10.5,3) {T28};
-
-  % Row 4
-  \node[tile] (c0r4) at (0,2) {T2};
-  \node[tile] (c1r4) at (1.5,2) {T5};
-  \node[tile] (c2r4) at (3,2) {T10};
-  \node[tile] (c3r4) at (4.5,2) {T13};
-  \node[tile] (c4r4) at (6,2) {T18};
-  \node[tile] (c5r4) at (7.5,2) {T21};
-  \node[tile] (c6r4) at (9,2) {T26};
-  \node[tile] (c7r4) at (10.5,2) {T29};
-
-  % Row 3
-  \node[tile] (c0r3) at (0,1) {T1};
-  \node[tile] (c1r3) at (1.5,1) {T6};
-  \node[tile] (c2r3) at (3,1) {T9};
-  \node[tile] (c3r3) at (4.5,1) {T14};
-  \node[tile] (c4r3) at (6,1) {T17};
-  \node[tile] (c5r3) at (7.5,1) {T22};
-  \node[tile] (c6r3) at (9,1) {T25};
-  \node[tile] (c7r3) at (10.5,1) {T30};
-
-  % Bottom row (row 2)
-  \node[tile] (c0r2) at (0,0) {T0};
-  \node[tile] (c1r2) at (1.5,0) {T7};
-  \node[tile] (c2r2) at (3,0) {T8};
-  \node[tile] (c3r2) at (4.5,0) {T15};
-  \node[tile] (c4r2) at (6,0) {T16};
-  \node[tile] (c5r2) at (7.5,0) {T23};
-  \node[tile] (c6r2) at (9,0) {T24};
-  \node[tile] (c7r2) at (10.5,0) {T31};
-
-  \draw[path] (-0.9,0) node[left] {input} -- (c0r2) -- (c0r3) -- (c0r4) -- (c0r5)
-             -- (c1r5) -- (c1r4) -- (c1r3) -- (c1r2)
-             -- (c2r2) -- (c2r3) -- (c2r4) -- (c2r5)
-             -- (c3r5) -- (c3r4) -- (c3r3) -- (c3r2)
-             -- (c4r2) -- (c4r3) -- (c4r4) -- (c4r5)
-             -- (c5r5) -- (c5r4) -- (c5r3) -- (c5r2)
-             -- (c6r2) -- (c6r3) -- (c6r4) -- (c6r5)
-             -- (c7r5) -- (c7r4) -- (c7r3) -- (c7r2)
-             -- (11.6,0) node[right] {output};
-\end{tikzpicture}}
-\caption{The 32-tile snake used in \code{resmlp/design.py}. Even-numbered columns are traversed bottom-to-top; odd-numbered columns top-to-bottom. Each node is one residual layer with its own weight matrix.}
-\label{fig:snake}
-\end{figure}
-
-In code, this ordering is generated by a tiny helper:
-\begin{lstlisting}[language=Python]
-def snake_tile_order(num_cols):
-    tiles = []
-    for col in range(num_cols):
-        rows = range(2, 6) if col % 2 == 0 else range(5, 1, -1)
-        for row in rows:
-            tiles.append((col, row))
-    return tiles
-\end{lstlisting}
-
-That function is deceptively simple. It is the point where the network
-architecture stops being abstract and starts matching the physical device.
-
-\subsection{Why \texorpdfstring{$H=160$}{H=160} and \texorpdfstring{$B=8$}{B=8}}
-
-The hidden dimension $H=160$ is chosen by SRAM, not by theory. A single tile must
-hold one $160\times160$ bf16 weight matrix plus the input and output activation
-buffers for a batch of 8 samples. Figure~\ref{fig:sram-budget} shows the
-budget.
-
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}[font=\small]
-  \draw[rounded corners=2pt, line width=0.8pt] (0,0) rectangle (9.6,1.1);
-  \fill[blue!55] (0,0) rectangle (7.5,1.1);
-  \fill[green!55] (7.5,0) rectangle (7.875,1.1);
-  \fill[orange!75] (7.875,0) rectangle (8.25,1.1);
-  \fill[gray!25] (8.25,0) rectangle (9.6,1.1);
-  \node[font=\bfseries] at (4.8,1.55) {Per-tile SRAM budget for $H=160$, $B=8$};
-  \node[text=white] at (3.75,0.55) {weights 50.0 KB};
-  \node[rotate=90] at (7.6875,0.55) {in 2.5};
-  \node[rotate=90] at (8.0625,0.55) {out 2.5};
-  \node at (8.925,0.55) {headroom 9.0 KB};
-\end{tikzpicture}
-\caption{The key design choice in one picture. The weight matrix dominates the budget; activations are small enough that one tile can hold one full layer comfortably.}
-\label{fig:sram-budget}
-\end{figure}
-
-Numerically:
-\begin{itemize}
-  \item weight matrix: $160\times160\times2 = 51{,}200$ bytes $\approx 50.0$ KB,
-  \item input activations: $8\times160\times2 = 2{,}560$ bytes,
-  \item output activations: $8\times160\times2 = 2{,}560$ bytes.
-\end{itemize}
-This lands at roughly 55 KB before stack and miscellaneous overhead, leaving
-comfortable headroom under the tile's local memory limit.
-
-The batch size $B=8$ follows from the MMUL granularity. The current kernel uses
-8$\times$8$\times$8 blocking and expects dimensions divisible by 8. Choosing
-$B=8$ is therefore the smallest clean batch that does not waste the MMUL shape.
-It is emphatically not the throughput-maximizing choice. It is the smallest
-choice that keeps the mapping simple and the tutorial honest.
-
-\subsection{BFP16 and tiled host layouts}
-
-The main branch compiles the kernel with
-\code{-DAIE\_API\_EMULATE\_BFLOAT16\_MMUL\_WITH\_BFP16}. In practice this means
-that host-side weights and activations are arranged into blocked 8$\times$8
-layouts, and the MMUL path uses a BFP16-style execution mode that aligns well
-with that blocking. The helper functions \code{to\_tiled()} and
-\code{from\_tiled()} in \code{resmlp/\_\_init\_\_.py} perform the required data
-reordering.
-
-This choice trades a small amount of numerical fidelity for a much cleaner and
-more uniform hardware mapping. In the test harness, the difference between the
-NPU path and a float32 reference compounds across 32 layers into noticeable
-per-element mismatch, but it does not meaningfully degrade classification
-accuracy.
-
-\section{From network to NPU program}
-
-\subsection{What one tile computes}
-
-The tile-local kernel in \code{aie\_kernels/matmul\_relu\_skip.cc} implements the
-whole layer in two steps: a blocked matrix multiply with ReLU, followed by a
-vectorized residual add.
-
-\begin{lstlisting}[language=C++]
-extern "C" void matmul_relu_skip_bf16(bfloat16 *a, bfloat16 *w, bfloat16 *c)
-{
-    static_assert(DIM_M % 8 == 0, "Batch must be multiple of 8");
-    static_assert(DIM_K % 8 == 0, "Input dim must be multiple of 8");
-    static_assert(DIM_N % 8 == 0, "Output dim must be multiple of 8");
-
-    ::aie::set_rounding(aie::rounding_mode::floor);
-    matmul_relu<bfloat16, (DIM_M / 8), (DIM_K / 8), (DIM_N / 8)>(a, w, c);
-    residual_add(a, c);
-}
-\end{lstlisting}
-
-Two details matter here.
-\begin{enumerate}
-  \item The current kernel is deliberately simple. It uses a 1$\times$1 output
-        blocking pattern rather than the more aggressive 2$\times$2 expansion used
-        in older throughput-oriented experiments.
-  \item The residual connection is explicit in the kernel. This keeps the NPU
-        path numerically close to the PyTorch model instead of forcing the host
-        to perform an extra add between layers.
-\end{enumerate}
-
-\subsection{How IRON describes the snake}
-
-The IRON design in \code{resmlp/design.py} mirrors the conceptual picture almost
-literally:
-\begin{itemize}
-  \item one activation FIFO into the first tile,
-  \item one activation FIFO out of the last tile,
-  \item one activation FIFO between every pair of consecutive snake stages,
-  \item one weight FIFO per column, split in the MemTile into four tile-local
-        weight streams,
-  \item one worker per compute tile.
-\end{itemize}
-
-The worker body itself is tiny:
-\begin{lstlisting}[language=Python]
-def worker_fn(of_in, of_out, of_w, kern):
-    x = of_in.acquire(1)
-    y = of_out.acquire(1)
-    w = of_w.acquire(1)
-    kern(x, w, y)
-    of_w.release(1)
-    of_in.release(1)
-    of_out.release(1)
-\end{lstlisting}
-
-This is one of the nicest properties of the current implementation. There is no
-large orchestration layer hidden elsewhere. The dataflow graph is already the
-program.
-
-An important subtlety is that the code uses plain \code{ObjectFifo}s for the
-activation chain, even across column boundaries. The compiler handles the
-required inter-column routing through the memory infrastructure; the Python code
-does not manually spell out every routing hop.
-
-\subsection{What moves during one inference call}
-
-The end-to-end inference path in \code{resmlp/infer.py} is:
-\begin{enumerate}
-  \item load a trained PyTorch checkpoint,
-  \item run the CPU embedding layer,
-  \item convert the hidden activations to tiled bf16 layout,
-  \item write input activations and packed weights to the NPU buffers,
-  \item execute the NPU runlist,
-  \item read back the final hidden state and apply the CPU classification head.
-\end{enumerate}
-
-The sizes are instructive.
-\begin{table}[t]
-\centering
-\small
-\begin{tabularx}{0.92\textwidth}{@{}lXr@{}}
-\toprule
-Buffer & Meaning & Size per batch \\
-\midrule
-Input activation & one $B\times H$ hidden-state batch entering tile 0 & 2.5 KB \\
-Output activation & one $B\times H$ batch leaving tile 31 & 2.5 KB \\
-Weight buffer & all 32 tiled $H\times H$ matrices packed together & 1.56 MB \\
-\bottomrule
-\end{tabularx}
-\caption{What the current runtime moves for each batch. The current implementation is weight-stationary during a call, but not across calls: the full weight buffer is written again for every batch.}
-\label{tab:buffer-sizes}
-\end{table}
-
-This weight rewrite cost per batch explains the modest measured performance. The
-model is structurally ``NPU-native'': each layer maps directly to one physical
-tile. But the current runtime still pays host-side setup and buffer-write costs
-every batch. This is not a bug; it is simply where the current implementation
-stops.
-
-\section{Results and what they mean}
-
-\subsection{Accuracy and speed}
-
-\begin{table}[t]
-\centering
-\small
-\begin{tabularx}{0.86\textwidth}{@{}lX@{}}
-\toprule
-Metric & Value \\
-\midrule
-Model parameters & 946K \\
-CPU test accuracy & 97.1\% \\
-NPU test accuracy & 97.16\% \\
-NPU stage latency in \code{infer.py} & 0.33 ms per batch of 8 \\
-NPU stage throughput in \code{infer.py} & 24,114 images/s \\
-Device-side benchmark in \code{test.py} & 55 GFLOPS for the full 32-tile snake \\
-\bottomrule
-\end{tabularx}
-\caption{The current main-branch results. The two performance numbers answer slightly different questions: \code{infer.py} includes host-side buffer writes for each batch, while the device-side benchmark isolates the NPU run itself more directly.}
-\label{tab:results}
-\end{table}
-
-The accuracy result is the easy part: the hardware path matches the software
-model closely enough that the NPU version classifies MNIST just as well as the
-CPU baseline. That gives us confidence that the mapping is correct.
-
-The speed result needs more interpretation. A batch of 8 through 32
-hidden layers performs roughly
-\[
-  32 \times \bigl(2 B H^2 + B H\bigr)
-  \approx 13.15\text{ million operations}
-\]
-for $B=8$ and $H=160$, counting both the matrix multiply and the residual add.
-That is not much work for a device with a 25-TFLOP bf16 headline. The design is
-therefore dominated by overheads: invocation cost, buffer writes, and the simple
-fact that $B=8$ was chosen for clarity, not for saturation.
-
-\subsection{Why the current design is far from peak throughput}
-
-The right way to read the current performance is not ``the NPU is slow.'' The
-right way to read it is ``this particular example is optimized for transparency.''
-Three factors dominate.
-\begin{enumerate}
-  \item \textbf{Small batch.} $B=8$ is the smallest neat MMUL-aligned batch, but it
-        leaves little work to amortize fixed costs.
-  \item \textbf{Per-batch weight writes.} The current runtime writes the entire
-        1.56 MB weight buffer every batch, even though the weights do not change.
-  \item \textbf{Simple kernel scheduling.} The main branch uses the simplest clean
-        kernel and routing strategy, not the most aggressively throughput-tuned one.
-\end{enumerate}
-
-This is why the paper should not be read as an argument that ``the best use of
-XDNA~2 is MNIST with $B=8$.'' It is instead an argument that a clean end-to-end
-example can make the co-design problem legible.
-
-\subsection{Why the example is still valuable}
-
-Despite the modest utilization, the current design teaches several things very
-cleanly.
-\begin{itemize}
-  \item A neural network can map directly to the physical tile graph with very
-        little abstraction gap.
-  \item The most important design question on this hardware is often SRAM budget,
-        not parameter count in the abstract.
-  \item A simple CPU/NPU split --- CPU for irregular edges, NPU for the repetitive
-        core --- is often the cleanest way to proceed.
-  \item Explicit data movement clarifies the true cost model: what stays local,
-        what streams, and what the host still has to do.
-\end{itemize}
-
-That is precisely why this repository pivoted away from more fragmented earlier
-iterations and toward the current \code{resmlp/} example.
-
-\section{Conclusion and next directions}
-
-The cleanest story in this repository is not ``we reached peak TOPS.'' It is
-``we built a neural network whose structure is dictated by the hardware, and we
-can explain every part of that mapping.'' That is already a useful result.
-
-For future work, the next steps are straightforward:
-\begin{itemize}
-  \item keep weights resident across calls instead of rewriting them every batch,
-  \item increase batch size to better amortize invocation overhead,
-  \item explore int8 variants,
-  \item move to a task that is more representative than MNIST once the mapping is
-        fully understood.
-\end{itemize}
-
-The older experimental history remains valuable --- especially the throughput
-benchmarks and language-model work --- but it belongs in \code{logbook.md} and the
-\code{experimental} branch. The main whitepaper should stay sharp: one device,
-one mapping, one working example, fully explained.
-
-\appendix
-
-\section{Current full-NPU training implementation}
-
-The main text explains the cleaner mapping that the current whitepaper is built
-around: CPU embedding, a 32-tile residual snake on the NPU, then a CPU
-classification head. The code in this repository now also contains a more
-ambitious training path in \code{resmlp/train\_npu.py}. That path moves the
-entire MNIST model onto the NPU for one training call: embedding, residual
-stack, classification head, loss, backward pass, and SGD updates.
-
-This appendix documents that implementation as it exists today. The important
-point is not that every systems problem is solved. It is that the training
-computation itself now lives on the array. The remaining rough edges are mostly
-runtime-state and persistence problems, not missing backpropagation math.
-
-\subsection{Tile layout and layer mapping}
-
-The full training graph still uses all 32 compute tiles, but not in the same
-role assignment as the inference snake from the main text. In
-\code{resmlp/training\_full\_design.py}, the 32 tiles are partitioned as shown in
-Table~\ref{tab:full-training-tiles}.
-
-\begin{table}[h]
-\centering
-\small
-\begin{tabularx}{0.92\textwidth}{@{}l l X@{}}
-\toprule
-Tiles & Role & What runs there \\
-\midrule
-tile 0 & embedding & \code{embed\_forward\_bf16} and \code{embed\_backward\_bf16} \\
-tiles 1--30 & hidden stack & one residual layer per tile: \code{matmul\_relu\_skip\_bf16} forward and \code{residual\_backward\_and\_update\_bf16} backward/update \\
-tile 31 & head + loss & \code{head\_forward\_loss\_bf16} and \code{head\_backward\_bf16} \\
-\bottomrule
-\end{tabularx}
-\caption{The current full-NPU training decomposition. The full path uses one
-embed tile, thirty residual tiles, and one head tile.}
-\label{tab:full-training-tiles}
-\end{table}
-
-This means that \code{full-npu} is a 30-residual-layer training design, not the
-older 32-residual-layer inference snake described earlier. The difference is
-structural, not cosmetic: the two end tiles are now used for the irregular
-edges of the network instead of being forced into the residual pattern.
-
-\subsection{What one training call does on the array}
-
-One invocation of the full training program performs the whole forward and
-backward path on device.
-\begin{enumerate}
-  \item The host streams a raw $8\times784$ MNIST batch into the embed tile.
-  \item The embed tile applies the $784\rightarrow32$ projection.
-  \item The activation flows through 30 residual tiles in snake order.
-  \item The head tile computes logits, softmax-cross-entropy quantities, class
-        predictions, and the tiled \code{d\_logits} buffer.
-  \item The backward pass starts at the head tile and propagates gradients back
-        through the residual chain to the embed tile.
-  \item Each stage applies its own SGD update in place.
-\end{enumerate}
-
-The backward kernels are the main novelty. The head kernel in
-\code{aie\_kernels/head\_backward.cc} computes
-\[
-  dY_{\text{hidden}} = d\text{logits}\, W_{\text{head}}^{T}
-\]
-and then applies
-\[
-  W_{\text{head}} \leftarrow W_{\text{head}} - \eta\, Y_{\text{hidden}}^{T} d\text{logits}.
-\]
-The residual kernel in \code{aie\_kernels/residual\_backward.cc} performs both
-gradient propagation through the skip-ReLU layer and the outer-product SGD
-update of the local $32\times32$ weight matrix. The embed kernel in
-\code{aie\_kernels/embed\_backward.cc} does the same for the $784\times32$
-projection matrix.
-
-In other words, the appendix-level claim is strong but precise: SGD is not
-simulated on the host after an NPU forward pass. The weight updates themselves
-are executed inside the AIE kernels.
-
-\subsection{How IRON wires the training graph}
-
-The IRON graph in \code{resmlp/training\_full\_design.py} is the clearest place
-to see how the training step is organized.
-\begin{itemize}
-  \item \code{embed\_wt} and \code{head\_wt} are direct weight FIFOs.
-  \item Residual weights enter as eight per-column FIFOs and are split in the
-        MemTiles into 3 or 4 tile-local weight streams, matching the snake
-        occupancy of each column.
-  \item Activations form one forward chain of \code{ObjectFifo}s.
-  \item Gradients form one backward chain of \code{ObjectFifo}s.
-  \item Each residual tile stores a compact checkpoint buffer containing its
-        input activation and ReLU mask, so the backward phase can reconstruct the
-        local gradient update.
-  \item A small \code{done\_fifo} marks backward completion, and
-        \code{head\_wt\_out} drains the updated head weights back to host-visible
-        memory.
-\end{itemize}
-
-One subtle but important detail is the embed backward phase. The embed tile does
-not keep the full raw $8\times784$ batch as a forward checkpoint in local SRAM.
-Instead, the host re-streams \code{x\_raw} during the backward phase. This is a
-good example of the actual programming style on the array: whenever a buffer is
-too awkward to keep resident, the design should make that data movement
-explicit.
-
-\subsection{What works today, and what does not}
-
-The current implementation is good enough to support the central claim of this
-appendix: the full network, the backward pass, and the SGD update rules can all
-run on the NPU in one training call. It is not yet a fully resident training
-loop across many batches.
-
-The stable path in \code{run\_full\_npu\_batch()} still uses a fresh
-\code{AIEContext} for every batch. That workaround remains necessary because
-reusing the same hardware context corrupts later invocations. The important
-refinement is that the wrapper no longer needs a full
-\code{DefaultNPURuntime.cleanup()} on every call. Evicting only the cached
-hardware contexts is enough to restore correct execution while keeping the
-instruction-buffer cache hot. Long runs still need a small amount of host-side
-garbage collection to release the invalidated contexts. In the current code,
-collecting every 256 full-NPU batches is enough to stay stable well past the
-two-thousand-context mark where a pure no-GC wrapper starts to fail.
-
-In the current stable configuration, host-visible persistence works reliably for
-\code{head\_wt} only. The embed and residual weights are updated in tile memory
-during a call, but the system does not yet drain them back in a form that can be
-reused safely across calls. Earlier attempts either exceeded SRAM, failed
-routing, or exhausted DMA descriptor resources.
-
-This changes the performance picture substantially. The NPU work itself still
-takes about 5 ms for the $B=8$, $H=32$ training design, but the wrapper around
-it is now only a small extra cost instead of a 250 ms teardown penalty. A
-limited 500-batch probe now completes in about 3.7 s while preserving the same
-learning behavior as the older fresh-runtime wrapper. So the present result
-should be read as both a correctness milestone and evidence that the runtime
-overhead is no longer the dominant bottleneck for this path.
-
-Even with that limitation, the path is no longer a dummy stub. In the current
-repository, the stable full-NPU training mode learns on MNIST instead of
-remaining at chance. After adding the periodic-GC safeguard, a full two-epoch
-MNIST run completes on hardware. In one representative run, epoch 0 takes
-about 77.6 s, epoch 1 about 125.3 s, and the final host-side accuracies are
-about 44.9\% on the training set and 45.6\% on the test set. The remaining gap
-to a cleaner throughput story comes from host-side fresh-context orchestration
-and missing full weight persistence, not from missing forward, backward, or SGD
-math on the array.
-
-\section{One-column simple convnet bring-up}
-
-To separate ``training math works on the array'' from the harder residual-state
-and persistence problems, the repository now also contains a deliberately small
-alternative path in \code{simplecnn/}. This design uses only one compute column
-and four trainable tiles:
-\begin{itemize}
-  \item tile 0: a $1\rightarrow4$ convolution, $3\times3$, stride 2, producing
-        $14\times14\times4$,
-  \item tile 1: a $4\rightarrow8$ convolution, $3\times3$, stride 2, producing
-        $7\times7\times8$,
-  \item tile 2: an $8\rightarrow16$ convolution, $3\times3$, stride 2,
-        producing $4\times4\times16$, followed by global average pooling,
-  \item tile 3: a linear $16\rightarrow10$ classifier with a tiny top-1 hinge
-        update.
-\end{itemize}
-
-This path started as a compile-oriented simplification, but it still needed a
-surprising amount of correctness work before the metrics meant anything. The
-generic conv training kernel overflowed tile program memory, so the final design
-uses three fixed-shape kernels (\code{conv1\_train.cc},
-\code{conv2\_train.cc}, \code{conv3\_train.cc}). More importantly, the model
-and the kernels had to agree on several non-obvious conventions:
-\begin{itemize}
-  \item conv weights are packed as \code{[out, ky, kx, in]}, not PyTorch's
-        native \code{[out, in, ky, kx]},
-  \item the pooled $8\times16$ buffer must stay row-major all the way into the
-        classifier head, not be silently reinterpreted as an $8\times8$ tiled
-        matrix,
-  \item generated MLIR / XCLBIN / instruction artifacts must fingerprint kernel
-        source changes as well as the Python design files, otherwise stale
-        binaries can survive apparently real rebuilds,
-  \item conv weight drainback needs explicit \code{wait=True}; without it, the
-        head weights drained correctly while the conv weights arrived on the host
-        as zeros.
-\end{itemize}
-
-After these fixes, one-batch NPU updates matched a bf16-quantized CPU replay of
-the same kernels closely, and the batch predictions matched exactly. That made
-the remaining limitation much clearer: the one-column convnet is now a
-parity-checked, stable full-NPU training path, but it is not yet a good MNIST
-model.
-
-\begin{table}[h]
-\centering
-\small
-\begin{tabular}{@{}rccrrr@{}}
-\toprule
-Epoch & Train acc & Test acc & Time (s) & Img/s & ms/call \\
-\midrule
-0 & 0.1114 & 0.1077 & 46.2 & 1298 & 5.3 \\
-1 & 0.1027 & 0.1033 & 42.3 & 1417 & 4.7 \\
-2 & 0.1031 & 0.1024 & 42.3 & 1420 & 4.7 \\
-3 & 0.1036 & 0.1023 & 42.4 & 1414 & 4.7 \\
-4 & 0.1034 & 0.1061 & 42.1 & 1425 & 4.7 \\
-5 & 0.1084 & 0.1065 & 42.4 & 1414 & 4.7 \\
-6 & 0.1084 & 0.1047 & 42.8 & 1401 & 4.7 \\
-7 & 0.1045 & 0.1023 & 42.0 & 1429 & 4.7 \\
-8 & 0.1031 & 0.1014 & 41.9 & 1433 & 4.7 \\
-9 & 0.1029 & 0.1016 & 41.5 & 1446 & 4.7 \\
-\bottomrule
-\end{tabular}
-\caption{Ten-epoch MNIST run for the original batch-oriented \code{simplecnn}
-baseline: batch size 8, one compute column, four trainable tiles, top-1 hinge
-head, NPU SGD step $\eta=0.05$, and one NPU call per batch.}
-\label{tab:simplecnn-10epoch}
-\end{table}
-
-That original baseline is mixed but useful. The design is stable across 10
-epochs with no numeric failure or runtime corruption, and the measured NPU call
-itself is small: about 4.7--5.3 ms. Throughput is also respectable for such a
-tiny pedagogical design, roughly 1.3--1.4k images/s. But the learning signal
-remains weak: the best test accuracy in this run is 10.77\% at epoch 0, and
-the final test accuracy is 10.16\% at epoch 9, which is effectively chance on
-MNIST.
-
-\subsection{Resident-window follow-up}
-
-After the 10-epoch bring-up, the next question was whether the one-column path
-could follow the same broad strategy used in AMD's official one-column streaming
-examples. The closer analogue is the edge-detect example: one task pipeline over
-a single compute column, using neighboring-tile memories and ping-pong-style
-buffering to reduce dead time between kernels. The scaled color-threshold
-example is a useful secondary reference, but it is primarily a MemTile
-split/concat design for data-parallel fanout and fanin, not a layer-parallel
-training pipeline.
-
-The practical adaptation for \code{simplecnn} was therefore at the
-host/runtime boundary first. The current CLI now groups minibatches into
-resident windows, keeps one shared host/device \code{weights} BO live for the
-whole window, and uses per-batch taps to address slices of larger host buffers.
-Crucially, the tile-side \code{ObjectFifo} payloads remain one-batch wide:
-making the tile FIFOs themselves window-sized immediately overflowed local
-SRAM, so the only scalable pattern is ``large host buffers, small tile buffers,
-repeated taps''. The current conservative default is
-\code{--window-batches 5}.
-
-\begin{table}[h]
-\centering
-\small
-\begin{tabular}{@{}rcrrr@{}}
-\toprule
-Window batches & Train batches & NPU calls & Img/s & ms/call \\
-\midrule
-1 & 10 & 10 & 371 & 19.5 \\
-5 & 10 & 2 & 470 & 78.5 \\
-5 & 100 & 20 & 456 & 84.7 \\
-\bottomrule
-\end{tabular}
-\caption{Resident-window \code{simplecnn} probes on hardware. The first row is
-the same resident host path forced back to \code{window\_batches=1}; the later
-rows show the validated default \code{window\_batches=5}.}
-\label{tab:simplecnn-resident-window}
-\end{table}
-
-This is real progress, but it is not yet the fully overlapped edge-detect-style
-win. The current workers still execute forward and backward for one batch before
-advancing to the next microbatch, and the graph still uses depth-1 FIFOs. So
-the gain above comes mainly from reducing host launches and host-visible weight
-traffic, not from a true multi-batch in-array pipeline. Stable windows are
-currently verified through five microbatches; \code{window\_batches=8} already
-compiles but still times out at runtime.
-
-This makes the current interpretation straightforward. The one-column convnet is
-not yet a useful MNIST baseline, but it \emph{is} a useful systems baseline. It
-shows that a much simpler four-tile training graph can now be compiled,
-validated against a quantized CPU replay, run stably for many epochs, and now
-also execute short resident windows with measurably lower host overhead. The
-remaining work is now about model quality and true in-array overlap, not
-whether the basic forward/backward/update path is functioning.
-
-\section{Deep streaming residual inference}
-
-The most encouraging recent result is that the repository now has a genuinely
-useful inference-only streaming path for the original 32-tile residual snake.
-The key simplification is to stop treating inference like training. For
-training, weights and ReLU state need to move in and out of the array and the
-host has to preserve backward-facing context. For inference, none of that is
-necessary. Each tile can simply hold its own fixed checkpoint weight matrix in
-SRAM, consume one activation microbatch, emit one activation microbatch, and do
-so repeatedly.
-
-This gives a design that is still easy to describe:
-\begin{itemize}
-  \item the CPU keeps the image flattening, embedding, and classifier head,
-  \item the NPU keeps the 32-layer residual body,
-  \item each compute tile stores one blocked $160\times160$ bf16 weight matrix
-        as a compile-time initialized local \code{Buffer},
-  \item the host-facing runtime contract shrinks to just \code{input} and
-        \code{output} buffers,
-  \item repeated calls reuse the same instructions and the same embedded
-        weights, so the host no longer re-sends the residual body parameters
-        every batch.
-\end{itemize}
-
-\subsection{What changed in the implementation}
-
-Two details mattered much more than they first appeared.
-
-First, inference needed its own kernel entrypoint. The original
-\code{matmul\_relu\_skip.cc} kernel had been extended for training so that it
-could also write a ReLU mask for the backward pass. That is correct for the
-training graph, but inference only wants the three logical tensors
-\code{(a, w, c)}. Reusing the five-argument training entrypoint in an
-inference graph silently scribbled mask data into unrelated buffers and made
-deep streaming look unstable long before the dataflow itself was the real
-problem. The final solution is a dedicated three-argument
-\code{matmul\_relu\_skip\_infer\_bf16} wrapper for inference while preserving
-the mask-writing entrypoint for training.
-
-Second, artifact naming had to become more disciplined. Once the same source
-file can produce both training and inference entrypoints across several hidden
-sizes, short names like ``\code{resmlp\_kernel.a}'' or
-``\code{resmlp\_streaming\_kernel.a}'' are no longer safe. The current
-operators fingerprint the relevant Python design files, kernel source, and, for
-streaming inference, the packed checkpoint weights themselves. That avoids the
-particularly confusing failure mode where an apparently fresh rebuild links a
-stale object compiled for a different hidden size or ABI.
-
-\subsection{From resident weights to deep streaming}
-
-With weights embedded, the first gain is easy to understand: even at
-\code{stream\_depth=1}, the design is already much faster than the old one-shot
-path because the host no longer pushes all 32 layer weights through DDR and the
-MemTiles on every call. The next step is to let one call carry several
-microbatches. In the current implementation, \code{stream\_depth} means exactly
-that: how many $B=8$ activation microbatches are fed through the snake before
-control returns to the host.
-
-The first implementation of this idea still hit an avoidable runtime ceiling.
-Even though the array-side workers were happy to loop over many microbatches,
-the host runtime issued one fill task and one drain task per microbatch. That
-kept the boundary FIFOs small, but it meant that deeper chunks stressed the
-shim-task schedule before they stressed the arithmetic.
-
-The fix was to keep the tile-local FIFOs exactly as small as before
-(\code{depth=2} for \code{stream\_depth > 1}) and instead change the boundary
-runtime contract. The current design uses a single repeated shim DMA fill and a
-single repeated shim DMA drain per call, driven by a custom
-\code{TensorAccessPattern} whose leading size is \code{stream\_depth}. In
-practice, that means one runtime task can replay the same $B\times H$
-microbatch transfer many times, so the first and last compute tiles never have
-to allocate a giant activation window in SRAM just to reach a deeper steady
-state.
-
-This is still not a fully free-running conveyor belt. Control still returns to
-the host after a finite chunk, and a true indefinitely running service would
-need a more persistent runtime abstraction. But inside that chunk, the array now
-does behave like the desired layered pipeline: while later tiles are working on
-older microbatches, earlier tiles can already start the next ones. The measured
-throughput scaling confirms that this overlap is real all the way to
-\code{stream\_depth=32}.
-
-\begin{table}[h]
-\centering
-\small
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-Mode & Images / call & Img/s & ms/call & Speedup vs one-shot \\
-\midrule
-One-shot residual inference & 8 & 35{,}026 & 0.228 & 1.0$\times$ \\
-Repeated-BD streaming, depth 1 & 8 & 70{,}771 & 0.113 & 2.0$\times$ \\
-Repeated-BD streaming, depth 2 & 16 & 137{,}510 & 0.116 & 3.9$\times$ \\
-Repeated-BD streaming, depth 4 & 32 & 260{,}881 & 0.123 & 7.4$\times$ \\
-Repeated-BD streaming, depth 8 & 64 & 478{,}327 & 0.134 & 13.7$\times$ \\
-Repeated-BD streaming, depth 16 & 128 & 898{,}220 & 0.143 & 25.6$\times$ \\
-Repeated-BD streaming, depth 32 & 256 & 1{,}458{,}411 & 0.176 & 41.6$\times$ \\
-\bottomrule
-\end{tabular}
-\caption{Full $H=160$, $B=8$, 8-column / 32-tile residual body on hardware.
-The one-shot baseline and all streaming rows use the same arithmetic workload;
-only the host/runtime contract changes.}
-\label{tab:deep-streaming-resmlp}
-\end{table}
-
-These numbers matter for two reasons. First, they show that resident weights
-alone are already worthwhile: depth 1 is about twice as fast as the old
-one-shot path. Second, the near-linear gain from depth 1 all the way to depth
-32 shows that multiple microbatches really are overlapping in the array rather
-than merely waiting in host memory. The current full-path sweep reaches about
-1.46 million images/s wall-clock throughput at depth 32, which corresponds to
-about 2.39 TFLOPS for the residual body. In a longer one-million-image
-benchmark, the same depth-32 configuration sustains about 1.51 million
-images/s wall-clock and about 1.59 million images/s if only kernel wait time is
-counted, or roughly 2.47 / 2.60 TFLOPS.
-
-These figures intentionally isolate the resident residual body. The public
-Python inference service still has to do endpoint work on the host --- at
-minimum layout conversion, and in the current $H=160$ path also the image
-embedding --- so end-to-end MNIST throughput is lower than the body-only upper
-bound above.
-
-\subsection{What depth 32 means --- and what it does not}
-
-At steady state, \code{stream\_depth=32} finally realizes the intuitive
-conveyor-belt picture for this 32-layer snake: each compute tile can be working
-on a different $B=8$ microbatch at the same time. That is the occupancy target
-the earlier finite-task runtime could not safely reach.
-
-What this does \emph{not} mean is that the whole MNIST inference graph is now
-on the NPU. The current public $H=160$ streaming path still keeps image
-flattening and embedding on the CPU; the residual body and classifier head now
-run on the NPU. That is a better end-to-end boundary than the earlier CPU-head
-split, but it still does not eliminate host work entirely: the residual-body
-measurements above are best read as the throughput ceiling of the resident
-snake itself, not as the wall-clock throughput of the full host-visible
-inference service.
-
-\subsection{End-to-end speedups versus pure CPU inference}
-
-To keep the throughput story honest, it helps to compare the full host-visible
-inference path against a plain PyTorch CPU baseline on the same machine.
-Table~\ref{tab:cpu-vs-npu-inference} includes the CPU-side endpoint work that
-still exists today: CPU embedding for the main $H=160$ split, and the CPU head
-for the narrower $H=32$ embed-on-tile-0 prototype.
-
-\begin{table}[h]
-\centering
-\small
-\begin{tabular}{@{}lrrr@{}}
-\toprule
-Path & Hidden dim & Img/s & Speedup vs pure CPU \\
-\midrule
-Pure CPU eager inference & 160 & 140{,}658 & 1.0$\times$ \\
-CPU embed + 32-tile NPU body + NPU head & 160 & 488{,}597 & 3.5$\times$ \\
-\addlinespace
-Pure CPU eager inference & 32 & 824{,}670 & 1.0$\times$ \\
-NPU embed + 31-tile NPU body + CPU head & 32 & 413{,}664 & 0.50$\times$ \\
-\bottomrule
-\end{tabular}
-\caption{End-to-end inference throughput on the same host. The pure CPU rows use
-the best measured PyTorch thread count on this machine (12 threads for
-$H=160$, 2 threads for $H=32$). The NPU rows include the host-side boundary
-work that still remains in the current Python service path.}
-\label{tab:cpu-vs-npu-inference}
-\end{table}
-
-The conclusion is encouraging, but also clarifying. For the original
-$H=160$ design, the NPU path now delivers a real end-to-end gain of roughly
-$3.5\times$ over pure CPU inference on this host. Moving the head onto the last
-tile also buys a modest but measurable gain over the earlier CPU-head split.
-The resident 32-tile snake is
-therefore not just a pretty internal benchmark; it does translate into a
-visible wall-clock speedup even after host-side boundary work is included.
-
-The $H=32$ prototype tells a different story. Moving the first layer onto tile
-0 is architecturally clean and it does work reliably at
-\code{stream\_depth=32}, but it is not yet a throughput win. The first tile now
-spends real time on the $784 \rightarrow 32$ projection, and the service still
-has to untile the final hidden state and run the classifier head on the CPU. In
-other words, endpoint migration is not automatically synonymous with higher
-throughput; it only helps if the new on-array stage is cheaper than the host
-work it replaces.
-
-\subsection{A throughput-oriented \texorpdfstring{$H=96$, $B=56$}{H=96, B=56} point}
-
-The same 32-layer residual template can also be pushed toward a more
-throughput-friendly point on the SRAM frontier by narrowing the hidden state and
-growing the microbatch. The best current example uses a
-$784 \rightarrow 96$ embedding, 32 residual layers of shape $96\times96$, and a
-$96 \rightarrow 10$ head. That model has $784\cdot96 + 96 = 75{,}360$
-parameters in the embed, $32\cdot96\cdot96 = 294{,}912$ in the residual body,
-and $96\cdot10 + 10 = 970$ in the head, for a total of 371{,}242 trainable
-parameters. One forward pass costs about 742{,}272 FLOPs/image if only the
-matrix multiplies are counted, or about 748{,}522 scalar floating-point
-operations/image if bias adds, ReLUs, and residual adds are included.
-
-On a 50k/10k MNIST train/validation split, a simple CPU-trained checkpoint
-reaches 97.27\% validation accuracy, and the streamed inference service
-reproduces 97.25\% through the NPU residual body. Using $B=56$ and
-\code{stream\_depth=32}, the repeated-image service benchmark processes about
-739{,}473 images/s wall-clock in the current host-visible path and about 3.88
-million images/s if only NPU kernel wait time is counted, corresponding to
-about 0.55 / 2.91 TFLOPS if the whole network forward pass is charged to the
-measurement. For this shape the public fused logits tail is not yet stable, so
-the present benchmark uses the correct body-only streamer with CPU embedding and
-CPU head in the Python service loop.
-
-We do \emph{not} claim this is a universal literature record. Direct MNIST
-throughput comparisons are surprisingly scarce and often differ in model family,
-quantization, batching, or whether host-side work is included at all. Public
-benchmark collections such as QuTiBench and GPU/TPU batch-size studies report
-MNIST inference regimes in the hundreds of thousands of images/s on very
-different systems \cite{qutibench-mnist,batch-size-gpu-tpu}. Our measured
-wall-clock figure therefore appears to be at least at the high end of the
-public MNIST throughput numbers we could find, but it should be read as a
-strong data point rather than an apples-to-apples claim of beating every
-published result.
-
-\subsection{A sustained CIFAR-10 throughput point}
-
-The same residual template also retargets cleanly to CIFAR-10. The highest
-wall-clock point we measured keeps the 32-tile snake intact, but changes the
-host-side projection to $3072\rightarrow32$, uses 32 residual layers of shape
-$32\times32$, and keeps the small $32\rightarrow10$ head on the final tile.
-That model has $3072\cdot32 + 32 = 98{,}336$ parameters in the embed,
-$32\cdot32\cdot32 = 32{,}768$ in the residual body, and $32\cdot10 + 10 = 330$
-in the head, for a total of 131{,}434 trainable parameters. One forward pass
-costs 262{,}784 FLOPs/image if only the matrix multiplies are counted, or about
-264{,}874 scalar floating-point operations/image if bias adds, ReLUs, and
-residual adds are included.
-
-Training this smaller model on CIFAR-10 is predictably less accurate than the
-wider MNIST-oriented shapes, but it remains nontrivial: the best checkpoint in
-the current run reaches 51.43\% validation accuracy and 51.20\% test accuracy.
-The best stable streaming operating point we measured is $B=176$ with
-\code{stream\_depth=64}$;$ pushing the same shape to
-\code{stream\_depth=128} currently runs into shim-DMA descriptor limits. On a
-repeated-image benchmark over 100{,}001{,}792 processed images, this
-configuration sustains 747{,}851 images/s wall-clock and 3.06 million
-images/s if only NPU kernel wait time is counted, corresponding to about
-0.20 / 0.81 TFLOPS if the full network forward pass is charged to the
-measurement.
-
-The most interesting lesson from this CIFAR-10 point is where the bottleneck
-moves. Over that 100M-image run, the host-side $3072\rightarrow32$ embed alone
-accounts for about 92.6~s of the 133.7~s wall time, while the NPU kernel itself
-accounts for about 32.7~s; the remaining few seconds are other host/runtime
-overhead. In other words, once the residual body is narrowed enough and the
-batch is pushed high enough, the resident 32-tile snake is no longer the
-limiting stage for throughput. The next systems win is not to squeeze a little
-more out of the tail worker, but to reduce or eliminate the CPU-side embed
-boundary.
-
-Public CIFAR-10 inference-throughput reporting is also much sparser than one
-might expect. MLPerf Inference does not currently include a CIFAR-10 task
-\cite{mlperf-inference}, so the most relevant public reference points come from
-older challenge leaderboards and accelerator-specific papers. Stanford DAWN's
-public CIFAR-10 inference leaderboard reports 0.1345~ms/image for a ResNet8
-TensorRT submission at 94.20\% accuracy (about 7{,}435 images/s), 0.6830~ms for
-a BaiduNet8 V100 submission at 94.32\% accuracy (about 1{,}464 images/s), and
-0.8280~ms for a custom ResNet9 P100 submission at 94.53\% accuracy (about
-1{,}208 images/s) \cite{dawn-cifar-inference}. FINN reports 21{,}906 CIFAR-10
-classifications/s at 80.1\% accuracy on a ZC706 FPGA platform under 25~W total
-system power \cite{finn-bnn}. QuTiBench's broader CIFAR-10 benchmark collection
-spans Jetson TX2 GPU, Xilinx DPU, FINN, BISMO, Edge TPU-class, and CPU points,
-with measured throughput ranging from hundreds of images/s on small edge
-deployments to tens of thousands on heavily quantized FPGA configurations
-\cite{qutibench-cifar,qutibench-paper}. We deliberately exclude recent A100
-CIFAR ``speedrun'' papers such as AIRBench from this comparison because those
-results optimize training time to an accuracy target, not steady-state
-inference throughput \cite{airbench-cifar-training}.
-
-Against that public inference-only context, the current sustained
-747{,}851~images/s wall-clock and 3.06~million images/s kernel-only figures are
-strikingly high. The correct caveat, however, is just as important as the
-throughput number itself: this $H=32$ operating point reaches only 51.20\% test
-accuracy, so it should be read as a systems-throughput result rather than as a
-claim that the current model achieves the best known accuracy/throughput
-tradeoff on CIFAR-10.
-
-Two follow-up experiments make that limitation much sharper. First, a plain
-GPU-trained CIFAR sanity baseline (\code{PreActResNet18}) reaches 90.66\% test
-accuracy after 10 epochs on the same machine, so the disappointing CIFAR result
-is not a statement that the local stack cannot learn CIFAR-10 at all. It is a
-statement about this particular high-throughput residual MLP. Second, a
-CIFAR-capable streamed convnet now runs correctly on hardware and matches the
-CPU reference numerically, but the correctness-first direct-convolution kernels
-collapse throughput to only about 355~images/s wall-clock for a 4-column shape
-and about 177~images/s for an 8-column shape, while validation accuracy is
-still only about 44.0\% and 35.6\%, respectively. In other words, the current
-repository contains two honest but incomplete CIFAR stories: a very fast MLP
-that is not yet accurate enough, and a numerically trustworthy conv path that
-is not yet remotely competitive on throughput.
-
-That is why CIFAR-10 should currently be read as a useful diagnostic workload,
-not as the cleanest headline demo for the resident-snake design. It exposed the
-host-side embed bottleneck very clearly, and it also showed that recovering
-spatial inductive bias without giving up the conveyor-belt throughput story is a
-substantially harder kernel-design problem than retargeting the existing MLP.
-Until the faster MMUL-style conv path is recovered, or the surrounding
-embed/head stages move onto the array, vector-style workloads remain the more
-natural fit for the throughput narrative.
-
-Taken together, these results are still strong while keeping the design
-conceptually modest:
-\begin{itemize}
-  \item no backward pass,
-  \item no host weight BO for the residual body,
-  \item one checkpoint-specific inference XCLBIN,
-  \item one explicit scalar knob, \code{stream\_depth}, controlling the amount
-        of in-array overlap,
-  \item one repeated shim DMA fill and one repeated shim DMA drain per call,
-        rather than one host DMA task per microbatch.
-\end{itemize}
-
-That is exactly the kind of systems win worth keeping in the main branch: a
-clear design and a measured throughput story. The remaining limitation is now a
-much better one to have: not ``can depth 32 work at all?'', but ``how much more
-of the surrounding graph should move on-array, and how much closer to peak can
-this runtime contract go?''.
-
-\subsection{Literature context for HIGGS}
-
-The HIGGS dataset was introduced by Baldi, Sadowski, and Whiteson as a
-large-scale signal-versus-background benchmark for collider physics: roughly
-11~million simulated events, a binary label, and 28 floating-point input
-features, of which 21 are low-level kinematic variables and 7 are
-high-level physics features derived from them \cite{baldi-higgs,uci-higgs}.
-That origin matters for this project. Unlike CIFAR-10, HIGGS is already a dense
-vector problem, so a residual MLP is at least structurally plausible before any
-throughput arguments are made.
-
-The literature around HIGGS then splits into two overlapping traditions. In
-high-energy physics, the original result showed that deep networks trained on
-the low-level variables can outperform shallower models and reduce the need for
-manually engineered high-level features \cite{baldi-higgs}. In general tabular
-machine learning, HIGGS became one of the canonical large-data benchmarks for
-systems papers on gradient-boosted trees such as XGBoost, LightGBM, and
-CatBoost \cite{xgboost-kdd,lightgbm-nips,catboost-paper}. More recent surveys
-of tabular learning still conclude that there is no universally superior neural
-architecture and that tree ensembles remain the safest overall accuracy
-baseline, even as modern tabular deep-learning models become more competitive
-\cite{rtdl-revisiting,grinsztajn-tabular}.
-
-One useful modern reference point is the RTDL benchmark of Gorishniy et al.,
-which compares tuned deep models and tree ensembles under one protocol on the
-reduced \code{higgs\_small} variant \cite{rtdl-revisiting,rtdl-revisit-repo}. The
-published test accuracies there are tightly clustered:
-\begin{table}[h]
-\centering
-\small
-\begin{tabular}{@{}lr@{}}
-\toprule
-Model & Test accuracy on \code{higgs\_small} \\
-\midrule
-FT-Transformer & 72.74\% \\
-ResNet-like MLP & 72.60\% \\
-XGBoost & 72.60\% \\
-LightGBM & 72.40\% \\
-CatBoost & 72.12\% \\
-Plain MLP & 72.09\% \\
-\bottomrule
-\end{tabular}
-\caption{Representative tuned results from the RTDL benchmark repository on
-\code{higgs\_small} \cite{rtdl-revisit-repo}.}
-\label{tab:higgs-small-rtdl}
-\end{table}
-
-Two conclusions from that literature matter for this whitepaper. First, HIGGS
-really is a serious benchmark for dense-vector models: modern neural tabular
-architectures are competitive there in a way that a plain MLP on CIFAR-10 is
-not. Second, the phrase ``state of the art on HIGGS'' has to be handled
-carefully. Rankings depend on whether a paper uses the full 11M-row dataset or
-the reduced \code{higgs\_small} variant, whether it reports accuracy, AUC, or
-physics-specific significance metrics, and how much hyperparameter search is
-allowed. For our purposes, the key point is narrower and more practical: HIGGS
-is a well-studied vector benchmark on which both boosted trees and modern
-tabular neural networks are credible baselines, which makes it a much better
-fit for the resident-snake throughput story than a spatial image task.
-
-A useful next question is whether the resident-snake points in this project
-stay in that same accuracy band once they are trained on real public data. For
-that pilot, I used the public Hugging Face mirror of the HIGGS benchmark splits
-\cite{jxie-higgs}, merged \code{train\_63k} and \code{val\_16k} into the local
-training pool, kept \code{test\_20k} fixed, and held out 15{,}688 examples
-inside the training pool for model selection. Both models were trained for 20
-epochs with AdamW ($\text{lr}=3\times10^{-3}$, weight decay $10^{-4}$), a
-cosine schedule down to $10^{-4}$, batch size 2048, no label smoothing, and no
-data augmentation; the best checkpoints landed at epoch 19 for the $L=8$ model
-and epoch 16 for the $L=32$ model. That is not byte-for-byte the exact RTDL
-protocol, but it is close enough to test the practical question that matters
-here: whether the throughput-friendly residual MLP remains a useful classifier
-once the data are real.
-
-\begin{table}[h]
 \centering
 \footnotesize
-\begin{tabular}{@{}lcccc@{}}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
 \toprule
-Model & CPU acc. & CPU ROC AUC & CPU PR AUC & Streamed NPU acc. \\
+Model & Training recipe \\
 \midrule
-$H=32$, $L=8$ & 71.76\% & 0.7946 & 0.8099 & 71.81\% \\
-$H=32$, $L=32$ & 72.04\% & 0.7956 & 0.8074 & 72.03\% \\
+$H=32$, $L=8$ full-data pilot &
+5 epochs on the AMD Radeon 890M ROCm path; AdamW, batch 8192, cosine
+$3\times10^{-3} \rightarrow 10^{-4}$, weight decay $10^{-4}$, no label smoothing. \\
+$H=32$, $L=32$ long schedule &
+20 epochs on the AMD Radeon 890M ROCm path; AdamW, batch 8192, cosine
+$3\times10^{-3} \rightarrow 10^{-4}$, weight decay $10^{-4}$, no label smoothing. \\
+$H=64$, $L=32$ overnight winner &
+Best checkpoint at epoch 46 of a 50-epoch MLflow/Optuna sweep on the AMD
+Radeon 890M ROCm path; AdamW, batch 4096, cosine
+$1.069\times10^{-3} \rightarrow 8.70\times10^{-5}$, weight decay
+$3.23\times10^{-3}$, label smoothing $0.0197$. \\
 \bottomrule
-\end{tabular}
-\caption{Real HIGGS pilot on the public \code{jxie/higgs} mirror. The streamed
-residual path already reproduces the CPU reference closely on real public data,
-and the CPU checkpoints land near 0.795 ROC AUC on the fixed 19{,}610-example
-test split.}
-\label{tab:higgs-real-pilot}
+\end{tabularx}
+\caption{Training recipes for the main reported HIGGS checkpoints. The paper
+branch keeps both the plain training entry point and the MLflow/Optuna sweep
+driver because both were used to produce the current best results.}
+\label{tab:training-protocol}
 \end{table}
 
-Those numbers matter more than their absolute size might suggest. They show
-that the HIGGS demo is no longer just a synthetic-throughput toy: the smallest
-8-layer point, which is also the highest-throughput configuration measured so
-far, lands within about one percentage point of the strongest tuned
-\code{higgs\_small} baselines in Table~\ref{tab:higgs-small-rtdl}. Just as
-importantly, the streamed NPU body reproduces the CPU reference to within
-measurement noise, so the deployment path is numerically credible.
-When the fused 2-class NPU head is enabled, the ranking metrics remain
-essentially unchanged: the $L=8$ checkpoint moves from ROC/PR AUC
-$0.7946/0.8099$ on CPU to $0.7947/0.8100$ on the NPU-head path, and the $L=32$
-checkpoint moves from $0.7956/0.8074$ to $0.7956/0.8075$.
+\section{Results}
 
-The small-split pilot answered the credibility question, but it still left a
-more ambitious one open: does the same throughput-friendly residual MLP get
-materially better once it is trained on the full public HIGGS data? To check
-that, I rebuilt the local cache directly from the published \code{train} and
-\code{test} parquet splits of the same \code{jxie/higgs} mirror, which yields
-10.5M training examples and a fixed 500k-example test set. For model selection
-I held out 100k examples from the training split, leaving 10.4M examples for
-optimization. The first full-data run kept the same $H=32$, $L=8$ model and
-the same AdamW-plus-cosine recipe, but increased batch size to 8192 and
-trained for only 5 epochs on the AMD Radeon 890M ROCm path. Even with the full
-100k validation pass every epoch, training took only about 27.8s/epoch, or
-roughly 374k training samples/s wall-clock. I then repeated the same 5-epoch
-recipe with the deeper $H=32$, $L=32$ model; that run took about 36.2s/epoch,
-still only about 1.3$\times$ slower than the 8-layer point. Because the deeper
-curve was still improving at the end of that pilot, I also reran the same
-$H=32$, $L=32$ model on a clean 20-epoch cosine schedule. Its best checkpoint
-arrived at epoch 18 and improved the full-data metrics again without obvious
-signs of overfitting.
+\subsection{Accuracy on the full public HIGGS split}
 
-\begin{table}[h]
+Table~\ref{tab:higgs-full-results} summarizes the current full-data results.
+The key point is that the repository is no longer trading only on a throughput
+narrative. Even this deliberately hardware-friendly residual MLP becomes a
+credible classifier once it is trained on the full public HIGGS data.
+
+\begin{table}[t]
 \centering
 \footnotesize
 \begin{tabular}{@{}lcccc@{}}
@@ -1406,45 +237,33 @@ Model & Test acc. & ROC AUC & PR AUC & Log loss \\
 \midrule
 $H=32$, $L=8$ full-data (5 epochs) & 75.89\% & 0.8430 & 0.8559 & 0.4861 \\
 $H=32$, $L=32$ full-data (5 epochs) & 76.56\% & 0.8502 & 0.8628 & 0.4762 \\
-$H=32$, $L=32$ full-data (20-epoch schedule) & 76.98\% & 0.8542 & 0.8668 & 0.4705 \\
-Optuna best: $H=64$, $L=32$ (50e cap) & 77.98\% & 0.8653 & 0.8770 & 0.4543 \\
+$H=32$, $L=32$ full-data (20 epochs) & 76.98\% & 0.8542 & 0.8668 & 0.4705 \\
+Optuna best: $H=64$, $L=32$ & 77.98\% & 0.8653 & 0.8770 & 0.4543 \\
 \bottomrule
 \end{tabular}
 \caption{Full-data HIGGS results on the public \code{jxie/higgs} mirror. The
-local cache uses the full published train/test splits (10.5M/500k rows);
-training holds out 100k examples for validation and fits on the remaining
-10.4M examples. The first two rows use the 5-epoch pilot recipe; the final row
-extends the 32-layer model to a clean 20-epoch cosine schedule and reports the
-best checkpoint from that longer run. The last row is the best completed trial
-from an 8-hour Optuna/MLflow overnight sweep with a 50-epoch cap.}
-\label{tab:higgs-full-first}
+validation split holds out 100k examples from the 10.5M published train split,
+leaving 10.4M examples for optimization and a fixed 500k-example test set for
+final reporting.}
+\label{tab:higgs-full-results}
 \end{table}
 
-Those full-data results materially strengthen the HIGGS story. The same minimal
-8-layer model that previously landed near 0.795 ROC AUC on the smaller public
-pilot now reaches 0.843 ROC AUC and 75.89\% accuracy on the fixed
-500k-example test set once it sees the full public training pool. The deeper
-32-layer model improves that further to 0.850 ROC AUC and 76.56\% accuracy in
-the 5-epoch pilot, and to 0.854 ROC AUC with 76.98\% accuracy once it is given
-a proper 20-epoch schedule. An overnight Optuna sweep then pushed the result
-again: the best completed trial moved to a wider $H=64$, $L=32$ model with
-batch size 4096, learning rate about $1.07\times10^{-3}$, weight decay about
-$3.23\times10^{-3}$, and mild label smoothing, reaching 0.865 ROC AUC,
-0.877 PR AUC, and 77.98\% accuracy on the fixed 500k-example test set. That is
-still not the final word on HIGGS, but it is a clear sign that the project is
-now competing in earnest on real large-tabular accuracy rather than only on a
-throughput narrative. The strongest trial also leaned into regularization
-rather than avoiding it, which is an encouraging hint that longer schedules and
-heavier weight decay are worth continuing to explore.
+Two observations matter. First, depth helps: moving from $L=8$ to $L=32$
+improves every metric even before any serious hyperparameter search. Second,
+the overnight sweep is worth keeping on \code{main}: the best completed trial
+moves from the high-0.85 ROC band to 0.865 ROC AUC while also improving
+accuracy, PR AUC, and log loss. This is still not a claim of state-of-the-art
+HIGGS accuracy, but it is strong enough that the repository's main story is no
+longer accuracy-indifferent.
 
-Once that real-data check passed, the next obvious question was whether the tiny
-$32 \to 2$ classifier head should also move on-array. The answer is
-counterintuitive but important for the throughput story: not yet. A fused
-2-class NPU head now works and keeps accuracy intact, but on the current tail
-kernel it actually reduces throughput compared with leaving that tiny head on
-the host.
+\subsection{Throughput of the conveyor-belt deployment}
 
-\begin{table}[h]
+Table~\ref{tab:higgs-throughput} reports the current repeated-sample throughput
+measurements over 50M processed samples. ``Wall throughput'' includes the host
+embed, host head, host-visible runtime overheads, and the NPU residual stage.
+``Kernel throughput'' counts only the NPU kernel wait time.
+
+\begin{table}[t]
 \centering
 \small
 \begin{tabular}{@{}llrr@{}}
@@ -1457,66 +276,57 @@ $H=32$, $L=32$, 8 columns & CPU head & 3.49M samples/s & 19.06M samples/s \\
 $H=32$, $L=32$, 8 columns & NPU head & 3.15M samples/s & 6.68M samples/s \\
 \bottomrule
 \end{tabular}
-\caption{Repeated-image throughput on the real HIGGS checkpoints over 50M
-processed samples. The throughput winner remains the 8-layer, 2-column path
-with the classifier head left on CPU.}
-\label{tab:higgs-real-throughput}
+\caption{Repeated-sample throughput on the real HIGGS checkpoints. The current
+winner remains the 8-layer, 2-column path with the classifier head left on CPU.}
+\label{tab:higgs-throughput}
 \end{table}
 
-That table sharpens the systems conclusion. For this HIGGS-sized model, the
-classifier head is not the wall-clock bottleneck; the current fused tail kernel
-is slower than a host-side $32 \to 2$ matmul, so moving the head on-array does
-not improve the main result. The best current point therefore remains the
-throughput-oriented 8-layer configuration at about 4.18M samples/s wall-clock,
-and the higher-leverage next step is still to move the $28 \to 32$ embed path
-on-array rather than insist on the present fused-head design.
+This table sharpens the systems conclusion. The best current wall-clock point
+is not the deepest model, and it is not the version with the entire graph moved
+onto the array. On the present tail kernel, the fused $H \rightarrow 2$ NPU head
+is slower than keeping that tiny classifier on CPU. For the curated branch,
+that is an important honest result: the right abstraction boundary today is a
+CPU embed, NPU residual body, and CPU head. The next hardware step is therefore
+not ``force everything on-array'' but ``move the expensive surrounding stages
+only when they really improve wall time''.
 
-\section{Compact glossary}
+\section{What this paper branch now claims}
 
-\begin{table}[h]
-\centering
-\small
-\begin{tabularx}{\textwidth}{@{}>{\bfseries}p{0.20\textwidth}X@{}}
-\toprule
-Term & Meaning in this project \\
-\midrule
-AIE tile & One compute tile of the XDNA~2 array: local memory + local compute + DMA connectivity \\
-MemTile & The memory tile that sits between shim tiles and compute tiles; useful for weight distribution and routing \\
-Shim tile & The interface tile that connects the array to host-visible memory and runtime infrastructure \\
-ObjectFIFO & IRON abstraction for explicit data channels between producers and consumers \\
-MMUL & Tile-local matrix-multiply datapath used by the AIE kernel intrinsics \\
-BFP16 & Execution mode used here to make 8$\times$8$\times$8 blocking clean and efficient \\
-XCLBIN & Compiled device artifact loaded by XRT \\
-XRT & Runtime that launches the compiled design on the NPU \\
-\bottomrule
-\end{tabularx}
-\caption{Only the terms that are repeatedly needed in the main text are kept here.}
-\end{table}
+The cleaned main branch makes a narrow but defensible claim.
+\begin{itemize}
+  \item A residual MLP can be shaped to match the AMD XDNA~2 array very
+        directly: one residual matrix per tile, streamed activations, explicit
+        routing, and checkpoint-specific resident weights.
+  \item That design already delivers multi-million-sample-per-second inference on
+        a real collider-style dense benchmark using cheap consumer hardware.
+  \item The same codebase also reaches nontrivial full-data HIGGS quality,
+        culminating in 77.98\% test accuracy and 0.865 ROC AUC on the fixed
+        500k-example test set.
+\end{itemize}
 
-\section{Toolchain in one page}
+Just as importantly, the branch now avoids claims it does not need. It does not
+pretend the current model is a production trigger, that the current tail kernel
+is optimal, or that the current HIGGS result is the final word on tabular
+accuracy. The point is simpler and cleaner: spatial hardware rewards spatially
+shaped models, and a small, explicit conveyor-belt design can already hit a
+useful combination of interpretability, throughput, and real-task credibility.
 
-The software pipeline in this repository is short enough to summarize directly:
-\begin{lstlisting}
-aie_kernels/matmul_relu_skip.cc
-    -> LLVM-AIE object
-    -> kernel archive
+\section{Conclusion and next steps}
 
-resmlp/design.py
-    -> Python-generated MLIR-AIE module
+The repository is now organized around one publishable message: designing a
+network for spatial compute on AMD XDNA~2 can produce unusually high throughput
+on real dense-event classification without turning the codebase into a maze of
+unrelated experiments. The paper branch therefore keeps only the residual-MLP
+training path, the HIGGS data path, the MLflow/Optuna sweep driver, and the
+forward-only streaming NPU deployment.
 
-MLIR-AIE + aiecc
-    -> .xclbin + instruction binary
+The next steps are correspondingly focused. The highest-leverage systems step is
+to move the $28 \rightarrow 32$ embed on-array so that the surrounding host work
+shrinks further. The highest-leverage modeling step is to continue exploiting
+the promising $H=64$, $L=32$ region with longer schedules and regularization,
+rather than broadening the scope of the branch again.
 
-XRT runtime
-    -> buffer setup + runlist execution on the NPU
-\end{lstlisting}
-
-The IRON project and the MLIR-AIE ecosystem are the main external dependencies
-for the hardware side of this repository \cite{iron,mlir-aie}. The Linux AMD NPU
-documentation is also useful for understanding the runtime and driver-facing view
-of the device \cite{amd-npu-linux}.
-
-\begin{thebibliography}{9}
+\begin{thebibliography}{99}
 
 \bibitem{iron}
 AMD, \emph{IRON repository}.\newline
@@ -1538,34 +348,6 @@ AMD, \emph{AI Engine documentation (programming model and architecture)}.\newlin
 \emph{AMD XDNA overview}.\newline
 \url{https://en.wikipedia.org/wiki/AMD_XDNA}
 
-\bibitem{qutibench-mnist}
-M. Blott et al., \emph{QuTiBench MNIST classification benchmark collection}.\newline
-\url{https://rcl-lab.github.io/QutibenchWeb/mnist/rooflines/performance%20prediction/2020/03/25/MNIST_Classification.html}
-
-\bibitem{qutibench-cifar}
-RCL-lab, \emph{QuTiBench CIFAR-10 classification benchmark collection}.\newline
-\url{https://rcl-lab.github.io/QutibenchWeb/cifar-10/rooflines/performance%20prediction/2020/03/25/CIFAR-10_Classification.html}
-
-\bibitem{qutibench-paper}
-M. Blott et al., \emph{QuTiBench: Benchmarking Neural Networks on Heterogeneous Hardware}.\newline
-\url{https://doi.org/10.1145/3358700}
-
-\bibitem{mlperf-inference}
-MLCommons, \emph{MLPerf Inference benchmark suite documentation}.\newline
-\url{https://docs.mlcommons.org/inference/}
-
-\bibitem{dawn-cifar-inference}
-Stanford DAWN, \emph{CIFAR-10 inference leaderboard}.\newline
-\url{https://dawnd9.sites.stanford.edu/cifar10-inference}
-
-\bibitem{finn-bnn}
-Y. Umuroglu et al., \emph{FINN: A Framework for Fast, Scalable Binarized Neural Network Inference}.\newline
-\url{https://arxiv.org/abs/1612.07119}
-
-\bibitem{airbench-cifar-training}
-K. Jordan et al., \emph{94\% on CIFAR-10 in 3.29 Seconds on a Single GPU}.\newline
-\url{https://arxiv.org/abs/2404.00498}
-
 \bibitem{baldi-higgs}
 P. Baldi, P. Sadowski, and D. Whiteson, \emph{Searching for Exotic Particles in
 High-Energy Physics with Deep Learning}.\newline
@@ -1579,6 +361,11 @@ UCI Machine Learning Repository, \emph{HIGGS dataset}.\newline
 J. Xie, \emph{HIGGS} (Hugging Face dataset mirror with published benchmark
 splits).\newline
 \url{https://huggingface.co/datasets/jxie/higgs}
+
+\bibitem{cms-phase2-l1}
+R. Ardino et al., \emph{Development and demonstration of the CMS Phase-2
+Level-1 trigger Data Scouting system}.\newline
+\url{https://doi.org/10.1088/1748-0221/21/01/C01024}
 
 \bibitem{xgboost-kdd}
 T. Chen and C. Guestrin, \emph{XGBoost: A Scalable Tree Boosting System}.\newline
@@ -1599,19 +386,10 @@ Y. Gorishniy, I. Rubachev, V. Khrulkov, and A. Babenko, \emph{Revisiting Deep
 Learning Models for Tabular Data}.\newline
 \url{https://arxiv.org/abs/2106.11959}
 
-\bibitem{rtdl-revisit-repo}
-Yandex Research, \emph{Revisiting Deep Learning Models for Tabular Data:
-official repository and published benchmark outputs}.\newline
-\url{https://github.com/yandex-research/tabular-dl-revisiting-models}
-
 \bibitem{grinsztajn-tabular}
 L. Grinsztajn, E. Oyallon, and G. Varoquaux, \emph{Why do tree-based models
 still outperform deep learning on tabular data?}.\newline
 \url{https://arxiv.org/abs/2207.08815}
-
-\bibitem{batch-size-gpu-tpu}
-Y. Gordienko et al., \emph{Batch Size Influence on Performance of Graphic and Tensor Processing Units During Training and Inference Phases}.\newline
-\url{https://link.springer.com/chapter/10.1007/978-3-030-16621-2_61}
 
 \end{thebibliography}
 

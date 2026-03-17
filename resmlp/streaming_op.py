@@ -6,6 +6,10 @@ import time
 
 import numpy as np
 
+from resmlp.xrt_env import ensure_xrt_python_path
+
+ensure_xrt_python_path()
+
 from iron.common import (
     AIEOperatorBase,
     InstsBinArtifact,
