@@ -36,7 +36,7 @@ def snake_tile_order(num_cols):
     return tiles
 
 
-def snake_pipeline(H=160, B=8, num_cols=8):
+def snake_pipeline(H=160, B=8, num_cols=8, archive_name="resmlp_kernel.a"):
     """Generate an IRON program for the residual MLP snake pipeline.
 
     Args:
@@ -59,7 +59,7 @@ def snake_pipeline(H=160, B=8, num_cols=8):
 
     # ── Kernel ───────────────────────────────────────────────────────
     kernel = Kernel(
-        "matmul_relu_skip_bf16", "resmlp_kernel.a",
+        "matmul_relu_skip_infer_bf16", archive_name,
         [act_ty, wt_ty, act_ty],
     )
 
@@ -83,8 +83,9 @@ def snake_pipeline(H=160, B=8, num_cols=8):
     # ── Activation FIFOs: DDR → tiles → DDR ──────────────────────────
     act_in = ObjectFifo(act_ty, name="act_in", depth=1)
     act_out = ObjectFifo(act_ty, name="act_out", depth=1)
-    inter = [ObjectFifo(act_ty, name=f"act_{i}", depth=1)
-             for i in range(num_tiles - 1)]
+    # One intermediate activation FIFO between each consecutive pair of snake tiles.
+    act_inter = [ObjectFifo(act_ty, name=f"act_{i}", depth=1)
+                 for i in range(num_tiles - 1)]
 
     # ── Worker function (same for all 32 tiles) ─────────────────────
     def worker_fn(of_in, of_out, of_w, kern):
@@ -103,13 +104,13 @@ def snake_pipeline(H=160, B=8, num_cols=8):
         if idx == 0:
             in_ep = act_in.cons()
         else:
-            in_ep = inter[idx - 1].cons()
+            in_ep = act_inter[idx - 1].cons()
 
         # Output: DDR for last tile, next tile's input otherwise
         if idx == num_tiles - 1:
             out_ep = act_out.prod()
         else:
-            out_ep = inter[idx].prod()
+            out_ep = act_inter[idx].prod()
 
         # Weight: from the per-column split
         wt_ep = wt_endpoints[idx]
@@ -126,7 +127,8 @@ def snake_pipeline(H=160, B=8, num_cols=8):
     host_wt_ty = np.ndarray[(num_tiles * H * H,), np.dtype[bfloat16]]
     host_out_ty = np.ndarray[(B * H,), np.dtype[bfloat16]]
 
-    col_wt_elems = ROWS_PER_COL * H * H  # elements per column's weight block
+    # Number of packed weight elements sent to one column before the MemTile split.
+    col_wt_elems = ROWS_PER_COL * H * H
 
     rt = Runtime()
     with rt.sequence(host_act_ty, host_wt_ty, host_out_ty) as (inp, wts, out):
