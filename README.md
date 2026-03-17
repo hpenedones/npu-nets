@@ -21,8 +21,35 @@ Older MNIST, CIFAR, convnet, and full backward-pass experiments live on the
 | --- | --- |
 | Best throughput point | `H=32, L=8`, CPU head, about **4.18M samples/s** wall-clock |
 | Best full-data manual run | `H=32, L=32`, 20-epoch schedule, **76.98%** test acc., **0.8542** ROC AUC |
-| Best overnight sweep result | `H=64, L=32`, **77.98%** test acc., **0.8653** ROC AUC, **0.8770** PR AUC |
+| Best validation-selected tuning result | `H=64, L=32`, **77.98%** test acc., **0.8653** ROC AUC, **0.8770** PR AUC |
 | Target hardware | AMD Ryzen AI 9 HX 370 / XDNA 2 |
+
+## Installation
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+For AMD GPU training, install a ROCm-enabled PyTorch wheel instead of the
+default CPU build, for example:
+
+```bash
+python -m pip install torch --index-url https://download.pytorch.org/whl/rocm6.3
+```
+
+For the XDNA2 NPU path you also need the AMD runtime/toolchain stack:
+
+```bash
+python -m pip install -e /path/to/IRON
+source /opt/xilinx/xrt/setup.sh
+```
+
+`requirements.txt` covers the pip-installable Python dependencies kept on
+`main`. The hardware path still depends on a working XRT installation and an
+editable `IRON` checkout.
 
 ## Quick start
 
@@ -88,7 +115,7 @@ resmlp/
 ├── data_utils.py           # HIGGS-only data loading and split helpers
 ├── prepare_higgs_cache.py  # Public-data cache materialization
 ├── train.py                # CPU/GPU training entry point
-├── tune_higgs_optuna.py    # MLflow + Optuna overnight sweeps
+├── tune_higgs_optuna.py    # MLflow + Optuna HIGGS sweeps
 ├── streaming_design.py     # IRON conveyor-belt MLIR generator
 ├── streaming_op.py         # XRT operator wrapper for the NPU body
 └── streaming_infer.py      # HIGGS evaluation / throughput benchmark CLI

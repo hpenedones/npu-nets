@@ -1,0 +1,25 @@
+# Core Python stack for the curated HIGGS / residual-MLP workflow.
+#
+# Install with:
+#   python -m pip install -r requirements.txt
+#
+# Notes:
+# - For AMD GPU training, install a ROCm-enabled PyTorch wheel instead of the
+#   default CPU build, e.g.:
+#     python -m pip install torch --index-url https://download.pytorch.org/whl/rocm6.3
+# - The XDNA2 NPU path additionally requires:
+#     * XRT under /opt/xilinx/xrt
+#     * an editable IRON checkout, e.g. python -m pip install -e /path/to/IRON
+# - mlir-aie wheel availability is platform-specific; follow the AMD / MLIR-AIE
+#   installation instructions if your environment cannot resolve it directly.
+
+torch
+numpy
+pandas
+pyarrow
+scikit-learn
+mlflow
+optuna
+pytest
+ml-dtypes
+mlir-aie
