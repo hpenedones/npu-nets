@@ -200,7 +200,20 @@ tests/
 docs/
 ├── whitepaper.tex          # Paper source
 ├── whitepaper.pdf          # Built paper
-└── xdna2_hardware.png      # Hardware figure used in the paper
+├── xdna2_hardware.png      # Hardware figure used in the paper
+├── accuracy_throughput_frontier.svg         # Frontier figure source from paper tables
+├── accuracy_throughput_frontier.pdf         # Paper-ready frontier figure
+├── generate_accuracy_throughput_frontier.py # Regenerates the frontier figure
+├── xdna2_compute_tile_internals.tex         # Standalone compute-tile appendix figure source
+├── xdna2_compute_tile_internals.pdf         # Built compute-tile appendix figure
+├── render_xdna2_compute_tile_internals.sh   # Regenerates the compute-tile appendix figure
+├── higgs_xdna2_model_hardware_mapping.tex   # Standalone mapping figure source
+├── higgs_xdna2_model_hardware_mapping.pdf   # Built mapping figure used in the paper
+├── render_higgs_xdna2_model_hardware_mapping.sh # Regenerates the mapping PDF
+├── generate_higgs_task_diagram.py           # Regenerates the HIGGS task appendix figure
+├── higgs_task_diagram.svg                   # HIGGS task appendix figure source
+├── higgs_task_diagram.png                   # PNG preview of the HIGGS task appendix figure
+└── higgs_task_diagram.pdf                   # Built HIGGS task appendix figure
 ```
 
 ## Historical material

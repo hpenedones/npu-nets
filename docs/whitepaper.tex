@@ -3,6 +3,7 @@
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
 \usepackage{lmodern}
+\usepackage{microtype}
 \usepackage{amsmath}
 \usepackage{graphicx}
 \usepackage{booktabs}
@@ -10,61 +11,65 @@
 \usepackage{array}
 \usepackage{enumitem}
 \usepackage{xcolor}
+\usepackage{float}
+\usepackage[font=small,labelfont=bf]{caption}
 \usepackage{hyperref}
+\usepackage[section]{placeins}
 \hypersetup{
   colorlinks=true,
   linkcolor=blue!60!black,
   urlcolor=blue!60!black,
   citecolor=blue!60!black,
-  pdftitle={NPU-Native Neural Networks on AMD XDNA 2},
+  pdftitle={NPU-Native Neural Networks on AMD XDNA 2: High-throughput residual inference for HIGGS},
   pdfauthor={Hugo Penedones}
 }
 \setlist{nosep}
+\captionsetup{skip=6pt}
 
 \newcommand{\code}[1]{\texttt{#1}}
 
 \title{NPU-Native Neural Networks on AMD XDNA~2}
 \author{Hugo Penedones}
-\date{}
+\date{\textbf{Draft} --- \today}
 
 \begin{document}
 \maketitle
 
 \begin{center}
-\large Conveyor-belt residual inference for HIGGS on AMD XDNA~2
+\large\color{black!70} High-throughput residual inference for HIGGS on AMD XDNA~2
 \end{center}
 
 \begin{abstract}
-This paper studies a deliberately narrow question: what neural-network shape
-matches the AMD XDNA~2 NPU when the goal is high-throughput, low-latency
-inference on dense collider-style features? The answer explored here is a
-forward-only residual MLP whose hidden body is laid out as a conveyor belt
-across the 32 compute tiles of the Strix Point array. Using the public HIGGS
-benchmark, we report two operating points: a throughput-oriented $H=32$,
-$L=8$ configuration that sustains about 4.18M samples/s wall-clock with the
+We study a deliberately narrow question: which neural-network shape best
+matches the AMD XDNA~2 NPU for high-throughput, low-latency inference on dense
+collider-style features? We answer it with a forward-only residual MLP whose
+hidden body streams across the 32 compute tiles of the Strix Point array. On
+the public HIGGS benchmark, we retain two key configurations: a speed-optimized
+$H=32$, $L=8$ model that sustains about 4.18M samples/s wall-clock with the
 tiny classifier head left on CPU, and a full-data $H=64$, $L=32$ model trained
 on 10.4M examples that reaches 77.98\% test accuracy, 0.865 ROC AUC, and 0.877
-PR AUC on the fixed 500k-example test split. The point is not that this model
-already wins every accuracy leaderboard; it is that the design is small enough
-to understand end to end, yet strong enough to make a credible systems case for
-dense event filtering on cheap consumer hardware.
+PR AUC on the fixed 500k-example test split. The design is small enough to
+understand end to end yet strong enough to support a credible systems case for
+dense event filtering on consumer hardware. The contribution is a measured
+co-designed operating regime, not a production trigger deployment, a
+state-of-the-art HIGGS accuracy paper, a fully on-array inference pipeline, or
+an energy-efficiency study.
 \end{abstract}
 
 \section{Introduction}
 
 Modern NPUs become most interesting when they stop being treated as ``small
-GPUs'' and start being treated more like conveyor belts. Instead of launching
-one large shared-memory kernel, the programmer assigns a small local job to one
-tile, hands the activations to the next tile, and repeats this until the full
-network has been traversed. That is the intuition behind spatial dataflow
-hardware. On AMD XDNA~2, the programmer sees a 2D array of compute tiles, each
-with local SRAM, a VLIW plus SIMD core, a matrix-multiply unit, and explicit
-routing. The central question is therefore no longer just ``what architecture
-is accurate?'', but also ``what architecture maps cleanly to many tiny memories
-connected by explicit streams?''.
+GPUs'' and start being programmed as spatial dataflow machines. Instead of
+launching one large shared-memory kernel, the programmer assigns a small local
+job to one tile, hands the activations to the next tile, and repeats until the
+full network has been traversed. On AMD XDNA~2, the programmer sees a 2D array
+of compute tiles, each with local SRAM, a VLIW plus SIMD core, a
+matrix-multiply unit, and explicit routing. The central question is therefore
+no longer just ``what architecture is accurate?'', but also ``what architecture
+maps cleanly to many tiny memories connected by explicit streams?''.
 
 The focus here is deliberately narrow: a residual MLP for HIGGS, with one
-residual matrix per tile and a forward-only conveyor-belt deployment on the
+residual matrix per tile and a forward-only spatial-streaming deployment on the
 NPU. The aim is not to survey every model family or every use of XDNA~2, but
 to isolate one design that can be understood end to end.
 
@@ -76,10 +81,26 @@ MLP structurally plausible before any hardware argument is made. It also makes
 the throughput story easier to defend. For example, the CMS Phase-2 Level-1
 trigger must inspect detector data at the 40~MHz bunch-crossing rate, produce
 decisions with a latency budget of about 12.5~$\mu$s, and emit accepted events
-at roughly 750~kHz \cite{cms-phase2-l1}. This project is not a production
-trigger design, but it does live in the same systems regime: dense features,
-strict latency sensitivity, and strong pressure for very high sustained
-throughput.
+at roughly 750~kHz \cite{cms-phase2-l1}. Those rates explain why
+multi-megasample-per-second measurements are interesting here, but they are not
+used to imply deployment equivalence: the best wall-clock repeated-sample
+result in this paper is 4.18M samples/s, above the accepted-event rate yet far
+below the full bunch-crossing stream, on a simpler host-assisted prototype.
+The point is to study the same general systems regime of dense features, strict
+latency sensitivity, and pressure for very high sustained throughput.
+
+This places the paper next to three adjacent literatures. For HIGGS itself, the
+reference landscape already includes both the original deep-versus-classic
+baseline framing and the strong tabular baselines now typically led by boosted
+tree ensembles \cite{baldi-higgs,xgboost-kdd,lightgbm-nips,catboost-paper,rtdl-revisiting,grinsztajn-tabular}. For
+low-latency collider inference, substantial prior work has targeted FPGA-based
+trigger deployments and related co-design flows \cite{duarte-fpga,cms-phase2-l1}. At
+the accelerator level, the closest precedent is the spatial/dataflow tradition,
+where local SRAM and explicit movement constrain the network shape as much as
+raw arithmetic throughput does \cite{dadiannao,eyeriss}. The claim here is
+narrower: given an existing benchmark, existing consumer NPU hardware, and an
+existing compiler/runtime stack, what is the simplest residual design that maps
+cleanly enough to the array to make a credible end-to-end systems case?
 
 \section{The hardware model we program against}
 
@@ -88,15 +109,16 @@ AI 9 HX 370 exposes 32 compute tiles arranged as 8 columns by 4 compute rows.
 Below them sit 8 MemTiles, and below those 8 shim tiles that connect the array
 to host-visible memory and runtime control.
 
-\begin{figure}[t]
+\begin{figure}[!ht]
 \centering
 \includegraphics[width=0.92\textwidth]{xdna2_hardware.png}
-\caption{Physical layout of the AMD XDNA~2 NPU used here. The design studied in
-this paper can use up to all 32 compute tiles (8 columns $\times$ 4 rows).}
+\caption{Physical layout of the AMD XDNA~2 NPU used here. The retained design
+can use all 32 compute tiles; the fastest variant uses only 2 columns, while
+the deeper $L=32$ body occupies the full 8-column array.}
 \label{fig:xdna-layout}
 \end{figure}
 
-\begin{table}[t]
+\begin{table}[!ht]
 \centering
 \small
 \begin{tabularx}{0.92\textwidth}{@{}lX@{}}
@@ -119,8 +141,8 @@ memories and explicit data movement.}
 These constraints shape the model directly. The hidden body is kept square so
 that each tile stores one $H \times H$ residual weight matrix. Widths are kept
 as multiples of 8 to match the AIE MMUL datapath. The host only moves the data
-that are still cheaper to keep on CPU today: the input embed and, for the best
-current throughput point, the tiny final $H \rightarrow 2$ classifier head.
+that are still cheaper to keep on CPU today: the input projection and, for the
+fastest retained variant, the tiny final $H \rightarrow 2$ classifier head.
 
 \section{A residual network that matches the array}
 
@@ -130,7 +152,9 @@ The network studied here is intentionally minimal.
 
 We use $H$ for hidden width, $L$ for the number of residual blocks, and $B$ for
 batch size. In the deployment path studied here, one residual block maps to one
-compute tile.
+compute tile. We use $\rightarrow$ for layer mappings (for example
+$H \rightarrow 2$ classifier) and $\times$ for matrix shapes (for example
+$H \times H$ weights).
 
 \subsection*{Model definition}
 
@@ -143,40 +167,63 @@ enter the array, flow through the tiles in a snake, and return to the host only
 after the full hidden body has completed. In the current deployment path:
 \begin{itemize}
   \item the host CPU runs the input projection from the native 28 HIGGS features
-        to hidden width $H$,
+         to hidden width $H$,
   \item the NPU runs the residual body,
   \item the host CPU currently keeps the tiny final $H \rightarrow 2$ head when
-        that is faster than the available fused on-array tail.
+         that is faster than the available fused on-array tail.
 \end{itemize}
 
-This design leads to two practical operating points.
+This design leads to two retained operating variants.
 \begin{itemize}
-  \item \textbf{Throughput point:} $H=32$, $L=8$, mapped to 2 columns. This is
-        the fastest end-to-end HIGGS point measured so far.
-  \item \textbf{Accuracy point:} $H=64$, $L=32$, trained on the full public
-        dataset and mapped to the full 8-column array when the deeper body is
-        streamed on the NPU.
+  \item \textbf{Speed-optimized variant:} $H=32$, $L=8$, mapped to 2 columns. This is
+         the fastest end-to-end HIGGS point measured so far.
+  \item \textbf{Accuracy-tuned variant:} $H=64$, $L=32$, trained on the full public
+         dataset and mapped to the full 8-column array when the deeper body is
+         streamed on the NPU.
 \end{itemize}
+
+The retained paper path keeps the narrow surround on CPU and uses the NPU only
+for the residual streaming body. The same snake-order placement then scales
+from the 2-column $L=8$ speed-optimized variant to the full 8-column $L=32$
+body; Figure~\ref{fig:model-hardware-mapping} makes that deployment contract
+concrete.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{higgs_xdna2_model_hardware_mapping.pdf}
+\caption{Model-to-hardware mapping for the retained HIGGS/XDNA~2 deployment
+path. The host CPU keeps the cheap $28 \rightarrow H$ input projection and, in
+the fastest retained path, the tiny $H \rightarrow 2$ head. The NPU assigns one
+$H \times H$ residual block per compute tile, using 2 columns for the
+$H=32$, $L=8$ speed-optimized variant and the full 8-column array for the deeper
+$L=32$ body.}
+\label{fig:model-hardware-mapping}
+\end{figure}
 
 The important design choice is not just ``use an MLP'', but ``use an MLP whose
-depth and width map almost literally to the array''. That keeps the design
+depth and width map directly to the array's tile structure''. That keeps the design
 simple enough to analyze and direct enough to deploy.
 
 \section{From Python model to NPU artifact}
 
-The toolchain is deliberately short. We start from
-\code{aie\_kernels/matmul\_relu\_skip.cc}, which defines the tile-local
-residual kernel. We then use \code{resmlp/streaming\_design.py} to generate the
-conveyor-belt MLIR-AIE program for a chosen $(H, B, L)$ shape.
-\code{resmlp/streaming\_op.py} wraps the compiled XCLBIN and instruction binary
-as a resident XRT operator. Finally, \code{resmlp/streaming\_infer.py} drives
-trained checkpoints through that operator and measures wall-clock throughput.
+The toolchain is deliberately short.
+\path{aie_kernels/matmul_relu_skip.cc} defines the tile-local residual kernel.
+\path{resmlp/streaming_design.py} turns a chosen $(H, B, L)$ shape into a
+spatial-streaming MLIR-AIE program. \path{resmlp/streaming_op.py} wraps the
+compiled XCLBIN and instruction binary as a resident XRT operator. Finally,
+\path{resmlp/streaming_infer.py} drives trained checkpoints through that
+operator and measures wall-clock throughput.
+
+The novelty claimed here is not a new compiler or runtime. IRON and MLIR-AIE
+already provide the compilation substrate \cite{iron,mlir-aie}; what is new is
+the model-to-array mapping, the host/NPU partition, and the end-to-end
+measurements of that co-designed path on real HIGGS checkpoints.
 
 A key detail of the current forward path is that the residual weights are
 embedded at compile time. Each throughput run therefore builds a
 checkpoint-specific streaming artifact. That is not the most general
 deployment contract. It is, however, the cleanest way to study the geometry,
-routing, and wall-clock behavior of a resident conveyor-belt design.
+routing, and wall-clock behavior of a resident spatial-streaming design.
 
 \section{Training protocol on HIGGS}
 
@@ -196,8 +243,11 @@ literatures. In high-energy physics it is a canonical dense-event benchmark
 large-data problems on which tree ensembles such as XGBoost, LightGBM, and
 CatBoost remain strong baselines, while modern deep tabular models are now more
 competitive but not universally dominant \cite{xgboost-kdd,lightgbm-nips,catboost-paper,rtdl-revisiting,grinsztajn-tabular}.
-That means good-enough accuracy on HIGGS is genuinely worth caring about, even
-if the main contribution of this work is still systems-oriented.
+That means the relevant bar is not ``beat every HIGGS leaderboard'', but
+``land in a statistically credible part of the baseline landscape while
+preserving a deployment shape the NPU can actually exploit''. Good-enough
+accuracy on HIGGS is therefore genuinely worth caring about even if the main
+contribution of this work remains systems-oriented.
 
 \begin{table}[t]
 \centering
@@ -247,27 +297,26 @@ $H=32$, $L=32$ full-data (20 epochs) & 76.98\% & 0.8542 & 0.8668 & 0.4705 \\
 Validation-selected tuning run: $H=64$, $L=32$ & 77.98\% & 0.8653 & 0.8770 & 0.4543 \\
 \bottomrule
 \end{tabular}
-\caption{Full-data HIGGS results on the public \code{jxie/higgs} mirror. The
-validation split holds out 100k examples from the 10.5M published train split,
-leaving 10.4M examples for optimization and a fixed 500k-example test set for
-final reporting.}
+\caption{Full-data HIGGS results on the public \code{jxie/higgs} mirror.
+Validation-selected tuning at $H=64$, $L=32$ reaches 0.865 ROC AUC while
+remaining within the same residual design family.}
 \label{tab:higgs-full-results}
 \end{table}
 
-Two observations matter. First, depth helps. Moving from $L=8$ to $L=32$
+Two key findings emerge. First, depth helps. Moving from $L=8$ to $L=32$
 improves every metric even before any serious hyperparameter search. Second,
-validation-driven hyperparameter tuning pushes the result from the high-0.85
-ROC band to 0.865 ROC AUC. It also improves accuracy, PR AUC, and log loss.
-This is still not a claim of state-of-the-art HIGGS accuracy. It is, however,
-strong enough that the main contribution of the paper is no longer
+validation-driven hyperparameter tuning lifts the result from the high-0.85 ROC
+band to 0.865 ROC AUC while also improving accuracy, PR AUC, and log loss.
+This is still not a claim of state-of-the-art HIGGS accuracy, but it is strong
+enough that the main contribution of the paper is no longer
 accuracy-indifferent.
 
-\subsection{Throughput of the conveyor-belt deployment}
+\subsection{Throughput of the spatial-streaming deployment}
 
 Table~\ref{tab:higgs-throughput} reports the current repeated-sample throughput
 measurements over 50M processed samples. ``Wall throughput'' includes the host
-embed, host head, host-visible runtime overheads, and the NPU residual stage.
-``Kernel throughput'' counts only the NPU kernel wait time.
+input projection, host head, host-visible runtime overheads, and the NPU
+residual stage. ``Kernel throughput'' counts only the NPU kernel wait time.
 
 \begin{table}[t]
 \centering
@@ -280,29 +329,54 @@ $H=32$, $L=8$, 2 columns & CPU head & 4.18M samples/s & 26.29M samples/s \\
 $H=32$, $L=8$, 2 columns & NPU head & 3.65M samples/s & 7.47M samples/s \\
 $H=32$, $L=32$, 8 columns & CPU head & 3.49M samples/s & 19.06M samples/s \\
 $H=32$, $L=32$, 8 columns & NPU head & 3.15M samples/s & 6.68M samples/s \\
+$H=64$, $L=32$, 8 columns & CPU head & 1.35M samples/s & 3.05M samples/s \\
 \bottomrule
 \end{tabular}
-\caption{Repeated-sample throughput on the real HIGGS checkpoints. The current
-winner remains the 8-layer, 2-column path with the classifier head left on CPU.}
+\caption{Repeated-sample throughput on the retained HIGGS checkpoints. The
+fastest wall-clock path is the 8-layer, 2-column variant with the classifier
+head left on CPU; the current fused on-array head is slower.}
 \label{tab:higgs-throughput}
 \end{table}
 
 This table sharpens the systems conclusion. The best current wall-clock point
 is not the deepest model, and it is not the version with the entire graph moved
-onto the array. On the present tail kernel, the fused $H \rightarrow 2$ NPU head
-is slower than keeping that tiny classifier on CPU. That is an important honest
-result: the right abstraction boundary in the current implementation is a CPU
-embed, NPU residual body, and CPU head. The next hardware step is therefore not
-``force everything on-array'' but ``move the expensive surrounding stages only
-when they really improve wall time''. A plausible reason is that the
-$H \rightarrow 2$ head is simply too small to amortize the extra synchronization,
-buffer traffic, and launch overheads of the fused tail path. In other words,
-the additional runtime machinery costs more than the CPU saves on this tiny
-matrix multiply.
+onto the array. The tuned $H=64$, $L=32$ checkpoint now runs cleanly on
+hardware, but it lands at only 1.35M samples/s wall-clock, so the additional
+width extends the accuracy frontier rather than the throughput frontier. On the
+width extends the accuracy frontier rather than the throughput frontier.
+
+On the present tail kernel, the fused $H \rightarrow 2$ NPU head is slower than
+keeping that tiny classifier on CPU. That is an important honest result: the
+fastest measured path is not yet a fully on-array pipeline, and the right
+abstraction boundary in the current implementation is a CPU input projection,
+NPU residual body, and CPU head. The next hardware step is therefore not
+``force everything on-array'' but ``move the surrounding stages only when they
+actually improve wall time''. A plausible reason is that the $H \rightarrow 2$
+head is simply too small to amortize the extra synchronization, buffer traffic,
+and launch overheads of the fused tail path. In other words, the added runtime
+machinery costs more than the CPU work it removes.
+
+Figure~\ref{fig:accuracy-throughput-frontier} combines the retained full-data
+accuracy rows with the measured CPU-head wall-throughput rows. It makes the
+trade-off explicit: $H=32$, $L=8$ is the wall-clock leader, $H=32$, $L=32$
+trades some speed for better accuracy, and the tuned $H=64$, $L=32$ run
+remains the accuracy ceiling, but at 1.35M samples/s wall-clock it sits well
+left of the two $H=32$ variants.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{accuracy_throughput_frontier.pdf}
+\caption{Accuracy-throughput frontier for the retained HIGGS/XDNA~2 variants.
+X-axis: test accuracy; Y-axis: wall-clock throughput in M samples/s. The three
+plotted throughput measurements use the CPU-head rows from
+Table~\ref{tab:higgs-throughput}, including the tuned $H=64$, $L=32$
+checkpoint.}
+\label{fig:accuracy-throughput-frontier}
+\end{figure}
 
 \section{Discussion}
 
-This study makes a narrow but defensible claim.
+The claim is deliberately narrow but defensible.
 \begin{itemize}
   \item A residual MLP can be shaped to match the AMD XDNA~2 array very
         directly: one residual matrix per tile, streamed activations, explicit
@@ -315,27 +389,161 @@ This study makes a narrow but defensible claim.
 \end{itemize}
 
 Just as importantly, the paper avoids claims it does not need. It does not
-pretend the current model is a production trigger, that the current tail kernel
-is optimal, or that the current HIGGS result is the final word on tabular
-accuracy. The point is simpler and cleaner: spatial hardware rewards spatially
-shaped models, and a small, explicit conveyor-belt design can already hit a
-useful combination of interpretability, throughput, and real-task credibility.
+present the current model as a production trigger deployment, the current HIGGS
+result as state of the art, the fastest path as a fully on-array pipeline, or
+the present measurements as an energy-efficiency study. The benchmark is
+public, the hardware is existing AMD XDNA~2, and the compiler/runtime substrate
+is pre-existing; none of those ingredients are introduced here. The novelty is
+the co-designed operating regime: a residual MLP whose hidden-body geometry
+matches the array closely enough that explicit spatial deployment yields both a
+useful throughput result and a statistically credible HIGGS checkpoint.
+
+A useful boundary from the SRAM accounting is that wider hidden bodies and
+wider surrounding inputs do not stress the current deployment in the same way.
+For the present $B=8$ spatial-streaming layout, an internal residual tile carries
+roughly $1024 + 2H^2 + 32H$ bytes, while the ingress tile carries
+$1024 + 2H^2 + 64H$ because it must hold both the host-ingress buffers and the
+first residual stage. That makes the first tile, not the middle of the belt,
+the width bottleneck. The retained layout still fits at $H=160$ with about
+62.5~KB live on the ingress tile, but the same accounting already pushes
+$H=168$ past 64~KB there even though the internal tiles would still fit. In the
+current paper, then, widening the hidden body is a genuine tile-SRAM limit of
+the current spatial-streaming placement.
+
+The surrounding stages are different. For the native 28-feature HIGGS input,
+even a padded $32 \rightarrow H$ input projection carries only $64H$ bytes of
+bf16 weights (4~KB at $H=64$, 10~KB at $H=160$), so keeping that stage on CPU
+today should not be read as evidence of an SRAM bottleneck. The awkward
+part is that 28 inputs do not naturally match the 8$\times$8 MMUL granularity,
+so an on-array ingress path must pay packing, alignment, and boundary-management
+costs. The same distinction is even clearer for the tiny $H \rightarrow 2$
+head: its weight footprint is negligible, and the measured slowdown of the
+fused NPU head is best understood as synchronization and launch overhead. This
+keeps the scope narrow. Within the HIGGS-style feature regime studied here,
+wider surrounding inputs mainly stress alignment and runtime boundaries,
+whereas the hard SRAM wall comes from widening the hidden body under the
+present first-tile layout.
 
 \section{Conclusion and next steps}
 
-The main result is straightforward: designing a network for spatial compute on
-AMD XDNA~2 can produce unusually high throughput on real dense-event
-classification while remaining simple enough to understand and validate end to
+The main result is simple: a network designed for spatial compute on AMD
+XDNA~2 can deliver unusually high throughput on real dense-event
+classification while remaining small enough to understand and validate end to
 end. The model family is deliberately modest, but it maps cleanly to the array
-and delivers both a strong throughput point and a nontrivial full-data HIGGS
-accuracy point.
+and yields both a strong speed-optimized variant and a nontrivial full-data
+HIGGS result.
+
+What exists today is a measured host-assisted prototype; fully on-array
+ingress/egress and energy-efficiency characterization remain future work.
 
 The next steps are correspondingly focused. The highest-leverage systems step is
-to move the $28 \rightarrow 32$ embed on-array so that the surrounding host work
-shrinks further. The highest-leverage modeling step is to continue exploiting
-the promising $H=64$, $L=32$ region with longer schedules and regularization,
-rather than broadening the scope of the architecture prematurely.
+still to move the $28 \rightarrow 32$ input projection on-array so that the surrounding
+host work shrinks further, but that should be understood mainly as an
+alignment/runtime clean-up rather than as a fix for a tile-SRAM shortfall. The
+SRAM-sensitive scaling question is different: wider hidden bodies will require
+revisiting the first-tile ingress layout because that tile reaches the 64~KB
+ceiling before the internal tiles do. The highest-leverage modeling step is to
+continue exploiting the promising $H=64$, $L=32$ region with longer schedules
+and regularization, rather than broadening the scope of the architecture
+prematurely.
 
+\clearpage
+\appendix
+
+\section{AMD XDNA~2 background}
+
+The main text intentionally keeps only the hardware facts that directly matter
+for the systems argument. For readers less familiar with AI Engine-class NPUs,
+Figure~\ref{fig:tile-internals} gives a programmer's logical view of one
+compute tile. It is not a physical floorplan. What matters here is that each
+tile combines local SRAM, a VLIW+SIMD control core, a tile-local MMUL datapath,
+and explicit DMA / FIFO connectivity. That combination makes
+weight-stationary streamed mappings natural on this hardware: weights can stay
+local, activations arrive through explicit buffers, and data movement must be
+planned rather than delegated to a large shared cache hierarchy
+\cite{amd-aie,amd-npu-linux}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.92\textwidth]{xdna2_compute_tile_internals.pdf}
+\caption{Logical view of one XDNA~2 compute tile from a programmer's point of
+view. The figure is schematic rather than a physical floorplan. What matters for
+this paper is the combination of tile-local SRAM, VLIW+SIMD control, MMUL-backed
+matrix math, and explicit DMA / FIFO movement between tiles.}
+\label{fig:tile-internals}
+\end{figure}
+
+Table~\ref{tab:npu-glossary} collects the hardware terms that recur most often
+in the paper. It is meant as a compact glossary, not an exhaustive one, but it
+gives enough background to follow the deployment discussion without already
+knowing the AI Engine vocabulary.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}>{\bfseries}p{0.18\textwidth}X@{}}
+\toprule
+Term & Meaning in this paper \\
+\midrule
+AIE tile & One compute tile of the XDNA~2 array: local SRAM, local compute, instruction memory, and DMA connectivity. \\
+MemTile & Memory-only tile between shim tiles and compute rows; useful for routing and on-chip buffering. \\
+Shim tile & Interface tile that connects the array to host-visible memory and runtime infrastructure. \\
+DMA & Hardware transfer mechanism used to move data between host-visible buffers and tile-local SRAM without CPU-managed copy loops. \\
+SIMD & Single Instruction, Multiple Data. One instruction operates on a vector of values at once. \\
+VLIW & Very Long Instruction Word. One instruction can encode multiple parallel operations such as loads, arithmetic, and control. \\
+MMUL & Tile-local matrix-multiply datapath used by the AIE kernel intrinsics; it strongly favors blocked 8$\times$8 layouts. \\
+ObjectFIFO & IRON abstraction for explicit producer/consumer channels between tiles and host boundary stages. \\
+XCLBIN / XRT & The compiled device artifact and the runtime that loads and launches it on the NPU. \\
+\bottomrule
+\end{tabularx}
+\caption{Compact glossary for the AMD XDNA~2 terms that are used repeatedly in
+the main text.}
+\label{tab:npu-glossary}
+\end{table}
+
+\FloatBarrier
+\clearpage
+\section{HIGGS physics background}
+
+The HIGGS benchmark comes from a standard collider-analysis setting: a rare
+target process must be separated from much more common look-alike processes
+using reconstructed event kinematics \cite{baldi-higgs}. The label is binary.
+In the UCI release, `1' denotes signal and `0' denotes background
+\cite{uci-higgs}. Physically, that does not mean the detector has directly
+``seen a Higgs.'' It means the reconstructed pattern of visible objects in the
+event is more consistent with the target signal process than with ordinary
+background production.
+
+Each row is therefore already one reconstructed collision event, not raw
+detector data. The low-level variables describe the visible ingredients of the
+event: one charged lepton, missing transverse momentum, and up to four jets,
+plus per-jet b-tag indicators \cite{uci-higgs}. In collider language, $p_T$ is
+momentum transverse to the beam, $\eta$ and $\phi$ encode direction, and
+missing transverse momentum records the momentum imbalance associated with
+invisible particles leaving the detector. The high-level variables are
+invariant-mass combinations such as $m_{jj}$, $m_{jjj}$, $m_{lv}$, $m_{jlv}$,
+$m_{bb}$, $m_{wbb}$, and $m_{wwbb}$; they test whether groups of reconstructed
+objects line up with a plausible underlying resonance or decay chain
+\cite{uci-higgs}.
+
+That structure is exactly why HIGGS is useful here. The model does not have to
+solve raw reconstruction. It receives a compact physics summary of each event
+and must make a fast signal-versus-background decision on dense numeric inputs.
+In this repository those examples come from the public \code{jxie/higgs} mirror
+of the published train/test split \cite{jxie-higgs}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth]{higgs_task_diagram.pdf}
+\caption{From reconstructed collision event to binary label in HIGGS. The
+dataset stores lepton, jet, missing-momentum, and derived invariant-mass
+features; the classifier must separate rare signal-like events from common
+look-alike background events.}
+\label{fig:higgs-task-background}
+\end{figure}
+
+\FloatBarrier
+\clearpage
 \section*{Disclosure of AI-assisted workflow}
 
 AI coding and research assistants, including Claude Opus 4.6, GPT-5.4, and
@@ -385,6 +593,20 @@ splits).\newline
 R. Ardino et al., \emph{Development and demonstration of the CMS Phase-2
 Level-1 trigger Data Scouting system}.\newline
 \url{https://doi.org/10.1088/1748-0221/21/01/C01024}
+
+\bibitem{duarte-fpga}
+J. Duarte et al., \emph{Fast inference of deep neural networks in FPGAs for
+particle physics}.\newline
+\url{https://doi.org/10.1088/1748-0221/13/07/P07027}
+
+\bibitem{dadiannao}
+Y. Chen et al., \emph{DaDianNao: A Machine-Learning Supercomputer}.\newline
+\url{https://doi.org/10.1109/MICRO.2014.58}
+
+\bibitem{eyeriss}
+Y.-H. Chen, J. Emer, and V. Sze, \emph{Eyeriss: A Spatial Architecture for
+Energy-Efficient Dataflow for Convolutional Neural Networks}.\newline
+\url{https://doi.org/10.1109/ISCA.2016.40}
 
 \bibitem{xgboost-kdd}
 T. Chen and C. Guestrin, \emph{XGBoost: A Scalable Tree Boosting System}.\newline

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="680" viewBox="0 0 1320 680" font-family="Inter, Arial, sans-serif">
+<defs>
+<marker id="arrowhead" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 12 6 L 0 12 z" fill="#334155"/></marker>
+</defs>
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text x="660.0" y="52" font-size="34" font-weight="700" fill="#0f172a" text-anchor="middle"><tspan x="660.0" dy="0">HIGGS benchmark: from reconstructed event to signal/background label</tspan></text>
+<text x="660.0" y="88" font-size="20" font-weight="400" fill="#475569" text-anchor="middle"><tspan x="660.0" dy="0">Each row is one reconstructed collision event summarized as 28 kinematic features.</tspan></text>
+<rect x="40" y="140" width="250" height="190" rx="20" fill="#e0f2fe" stroke="#0369a1" stroke-width="2.5"/>
+<text x="64" y="178" font-size="24" font-weight="700" fill="#0f172a" text-anchor="start"><tspan x="64" dy="0">Reconstructed</tspan><tspan x="64" dy="24"> event</tspan></text>
+<text x="64" y="234" font-size="19" font-weight="400" fill="#0f172a" text-anchor="start"><tspan x="64" dy="0">1 charged lepton</tspan><tspan x="64" dy="24">missing pT</tspan><tspan x="64" dy="24">up to 4 jets</tspan><tspan x="64" dy="24">per-jet b-tag scores</tspan></text>
+<rect x="330" y="112" width="410" height="250" rx="20" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2.5"/>
+<text x="354" y="150" font-size="24" font-weight="700" fill="#0f172a" text-anchor="start"><tspan x="354" dy="0">28 kinematic features</tspan></text>
+<text x="354" y="184" font-size="19" font-weight="400" fill="#0f172a" text-anchor="start"><tspan x="354" dy="0">21 low-level observables</tspan><tspan x="354" dy="24">7 derived masses</tspan><tspan x="354" dy="24">lepton / jets: pT, η, φ</tspan><tspan x="354" dy="24">missing pT magnitude + φ</tspan><tspan x="354" dy="24">m_jj, m_lv, m_bb, ...</tspan></text>
+<rect x="795" y="170" width="210" height="160" rx="20" fill="#ede9fe" stroke="#6d28d9" stroke-width="2.5"/>
+<text x="819" y="208" font-size="24" font-weight="700" fill="#0f172a" text-anchor="start"><tspan x="819" dy="0">Classifier</tspan></text>
+<text x="819" y="242" font-size="19" font-weight="400" fill="#0f172a" text-anchor="start"><tspan x="819" dy="0">outputs a score</tspan><tspan x="819" dy="24">more signal-like</tspan><tspan x="819" dy="24">or background-like</tspan><tspan x="819" dy="24">repo model: residual MLP</tspan></text>
+<rect x="1050" y="86" width="230" height="150" rx="20" fill="#dcfce7" stroke="#15803d" stroke-width="2.5"/>
+<text x="1074" y="124" font-size="24" font-weight="700" fill="#0f172a" text-anchor="start"><tspan x="1074" dy="0">Signal</tspan><tspan x="1074" dy="24">(label 1)</tspan></text>
+<text x="1074" y="180" font-size="19" font-weight="400" fill="#0f172a" text-anchor="start"><tspan x="1074" dy="0">rare target process</tspan><tspan x="1074" dy="24">used to define</tspan><tspan x="1074" dy="24">positive examples</tspan></text>
+<rect x="1050" y="286" width="230" height="150" rx="20" fill="#fee2e2" stroke="#b91c1c" stroke-width="2.5"/>
+<text x="1074" y="324" font-size="24" font-weight="700" fill="#0f172a" text-anchor="start"><tspan x="1074" dy="0">Background</tspan><tspan x="1074" dy="24">(label 0)</tspan></text>
+<text x="1074" y="380" font-size="19" font-weight="400" fill="#0f172a" text-anchor="start"><tspan x="1074" dy="0">ordinary processes</tspan><tspan x="1074" dy="24">with a similar</tspan><tspan x="1074" dy="24">visible final state</tspan></text>
+<line x1="290" y1="235" x2="330" y2="235" stroke="#334155" stroke-width="4" marker-end="url(#arrowhead)"/>
+<line x1="740" y1="250" x2="795" y2="250" stroke="#334155" stroke-width="4" marker-end="url(#arrowhead)"/>
+<path d="M 1005 224 L 1028 224 L 1028 160 L 1050 160" fill="none" stroke="#334155" stroke-width="4" marker-end="url(#arrowhead)"/>
+<path d="M 1005 276 L 1028 276 L 1028 360 L 1050 360" fill="none" stroke="#334155" stroke-width="4" marker-end="url(#arrowhead)"/>
+<line x1="80" y1="472" x2="1240" y2="472" stroke="#cbd5e1" stroke-width="2"/>
+<text x="660.0" y="525" font-size="18" font-weight="400" fill="#334155" text-anchor="middle"><tspan x="660.0" dy="0">pT = transverse momentum   •   η, φ = direction coordinates   •   b-tag = jet likely from a b quark</tspan></text>
+<text x="660.0" y="560" font-size="18" font-weight="400" fill="#334155" text-anchor="middle"><tspan x="660.0" dy="0">missing pT = momentum imbalance from invisible particles   •   m_jj, m_lv, m_bb = invariant-mass combinations</tspan></text>
+<text x="660.0" y="620" font-size="22" font-weight="600" fill="#0f172a" text-anchor="middle"><tspan x="660.0" dy="0">Physics goal: separate rare signal-like events from common look-alike background events.</tspan></text>
+</svg>
