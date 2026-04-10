@@ -130,7 +130,7 @@ the deeper $L=32$ body occupies the full 8-column array.}
 Property & Why it matters here \\
 \midrule
 32 compute tiles (8 columns $\times$ 4 rows) & Depth maps naturally to tile count; an $L=8$ body uses 2 columns, an $L=32$ body uses the full array. \\
-About 64 KB local SRAM per compute tile & Parameters must stay small enough to live locally; that strongly constrains hidden width. \\
+About 64 KB local SRAM per compute tile \cite{amd-aie,amd-npu-linux} & Parameters must stay small enough to live locally; that strongly constrains hidden width. \\
 8$\times$8 MMUL-friendly blocked execution & Widths and batch sizes should be divisible by 8, and host-side packing must respect tiled layouts. \\
 Explicit FIFOs, DMA, and routing & Data movement is part of the design, not an afterthought hidden behind a cache hierarchy. \\
 IRON / MLIR-AIE / XRT software stack & The implementation programs the array close to the hardware model rather than through a high-level opaque runtime. \\
@@ -350,7 +350,6 @@ This table sharpens the systems conclusion. The best current wall-clock point
 is not the deepest model, and it is not the version with the entire graph moved
 onto the array. The tuned $H=64$, $L=32$ checkpoint now runs cleanly on
 hardware, but it lands at only 1.35M samples/s wall-clock, so the additional
-width extends the accuracy frontier rather than the throughput frontier. On the
 width extends the accuracy frontier rather than the throughput frontier.
 
 On the present tail kernel, the fused $H \rightarrow 2$ NPU head is slower than
